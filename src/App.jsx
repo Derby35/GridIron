@@ -661,10 +661,8 @@ function posGroupScore(roster, statsCache, pos, topN) {
 }
 
 function calcPreds(players, statsCache, standings) {
-  const maxHist = Math.max(...ALL_AB.map(ab => {
-    const h = HIST[ab] || {};
-    return (h.recentScore||0) + (h.sbWins||0) + (h.deepRuns||0);
-  }));
+  const histVals = ALL_AB.map(ab => { const h = HIST[ab]||{}; return (h.recentScore||0)+(h.sbWins||0)+(h.deepRuns||0); });
+  const maxHist = histVals.length ? Math.max(...histVals) : 1;
 
   return ALL_AB.map(ab => {
     const roster  = players.filter(p => p.tm === ab);
@@ -969,7 +967,7 @@ export default function App() {
     fetchAllRosters().then(pl=>{
       setPlayers(pl);
       setLoading(false);
-    });
+    }).catch(()=>setLoading(false));
   },[]);
 
   const go = t=>{setTab(t);window.scrollTo(0,0)};
