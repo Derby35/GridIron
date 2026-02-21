@@ -943,7 +943,7 @@ function posGroupScore(roster, statsCache, pos, topN) {
   return fpts.reduce((s, v) => s + v, 0) / (topN * 200); // 0–1
 }
 
-function calcPreds(players, statsCache, standings) {
+function calcPreds(players, statsCache, standings24, standings25) {
   const histVals = ALL_AB.map(ab => { const h = HIST[ab]||{}; return (h.recentScore||0)+(h.sbWins||0)+(h.deepRuns||0); });
   const maxHist = histVals.length ? Math.max(...histVals) : 1;
 
@@ -951,7 +951,8 @@ function calcPreds(players, statsCache, standings) {
   const items = ALL_AB.map(ab => {
     const roster  = players.filter(p => p.tm === ab);
     const h       = HIST[ab] || {};
-    const stand   = standings[ab] || null;
+    const stand24 = standings24[ab] || null;
+    const stand25 = standings25[ab] || null;
 
     // Historical score 0–10
     const rawHist = (h.recentScore||0) + (h.sbWins||0) + (h.deepRuns||0);
@@ -967,19 +968,27 @@ function calcPreds(players, statsCache, standings) {
       ? (qbScore * 0.35 + rbScore * 0.2 + wrScore * 0.3 + teScore * 0.15)
       : Math.min(10, roster.length * 0.65);
 
-    // 2024 actual wins anchor (if loaded)
-    const actualW24 = stand ? stand.wins : null;
+    // Actual wins from standings (prefer 2025, fall back to 2024)
+    const actualW24 = stand24 ? stand24.wins : null;
+    const actualW25 = stand25 ? stand25.wins : null;
 
     // Combined score 0–10 (history 35%, roster 45%, last-season record 20%)
-    const recScore = actualW24 !== null ? (actualW24 / 17) * 10 : histScore;
+    const recScore = actualW25 !== null ? (actualW25 / 17) * 10
+                   : actualW24 !== null ? (actualW24 / 17) * 10
+                   : histScore;
     const score = histScore * 0.35 + rosterScore * 0.45 + recScore * 0.20;
 
-    // Estimate 2025 wins as intermediate, then project 2026 / 2027 / 2028
-    const base24 = actualW24 !== null ? actualW24 : 4 + score * 1.1;
-    const est25  = base24 * 0.92 + score * 0.18;
-    const p26 = Math.round(Math.min(15, Math.max(3, est25)));
-    const p27 = Math.round(Math.min(15, Math.max(3, p26 * 0.93 + score * 0.12)));
-    const p28 = Math.round(Math.min(15, Math.max(3, p27 * 0.91 + score * 0.10)));
+    // Mean-reversion projections — top teams regress, bottom teams improve each year
+    // NFL long-run average ≈ 8.5 wins; deviation shrinks ~30% per season
+    const NFL_MEAN  = 8.5;
+    const anchor    = actualW25 !== null ? actualW25
+                    : actualW24 !== null ? actualW24
+                    : 4 + score * 1.1;
+    const deviation = anchor - NFL_MEAN;
+    const rosterAdj = (score - 5) * 0.3; // -1.5 to +1.5 based on roster quality
+    const p26 = Math.round(Math.min(16, Math.max(2, NFL_MEAN + deviation * 0.72 + rosterAdj)));
+    const p27 = Math.round(Math.min(15, Math.max(3, NFL_MEAN + deviation * 0.48 + rosterAdj * 0.7)));
+    const p28 = Math.round(Math.min(14, Math.max(3, NFL_MEAN + deviation * 0.30 + rosterAdj * 0.5)));
 
     const sbOdds = Math.round(Math.max(1, Math.min(35, score * score * 0.35)));
 
@@ -988,7 +997,7 @@ function calcPreds(players, statsCache, standings) {
       histScore: +histScore.toFixed(1), rosterScore: +rosterScore.toFixed(1),
       qbScore: +qbScore.toFixed(1), rbScore: +rbScore.toFixed(1),
       wrScore: +wrScore.toFixed(1), teScore: +teScore.toFixed(1),
-      actualW24, p26, p27, p28, sbOdds, hasStats,
+      actualW24, actualW25, p26, p27, p28, sbOdds, hasStats,
     };
   });
 
@@ -1005,18 +1014,21 @@ function calcPreds(players, statsCache, standings) {
 }
 
 const Predictions = ({goT, players, statsCache, setStatsCache}) => {
-  const [sortBy,    setSortBy]    = useState("score");
-  const [standings, setStandings] = useState({});
-  const [fetching,  setFetching]  = useState(false);
-  const [fetchDone, setFetchDone] = useState(false);
-  const [progress,  setProgress]  = useState(0);
+  const [yearTab,     setYearTab]    = useState("2026");
+  const [standings24, setStandings24] = useState({});
+  const [standings25, setStandings25] = useState({});
+  const [fetching,    setFetching]   = useState(false);
+  const [fetchDone,   setFetchDone]  = useState(false);
+  const [progress,    setProgress]   = useState(0);
+  const [showCheat,   setShowCheat]  = useState(false);
 
-  // Fetch real 2024 standings from ESPN on mount
+  // Fetch real 2024 + 2025 standings from ESPN on mount
   useEffect(() => {
-    espn(`${SITE}/standings?season=2024`).then(d => {
+    const parse = (d) => {
+      if (!d) return {};
       const map = {};
       const extract = (entries) => {
-        for (const e of entries) {
+        for (const e of (entries||[])) {
           const ab  = e.team?.abbreviation;
           const stats = e.stats || [];
           const wStat = stats.find(s => s.name === "wins" || s.abbreviation === "W");
@@ -1029,7 +1041,14 @@ const Predictions = ({goT, players, statsCache, setStatsCache}) => {
         if (ch.standings?.entries) extract(ch.standings.entries);
         if (ch.children) for (const cc of ch.children) extract(cc.standings?.entries || []);
       }
-      setStandings(map);
+      return map;
+    };
+    Promise.all([
+      espn(`${SITE}/standings?season=2024`),
+      espn(`${SITE}/standings?season=2025`),
+    ]).then(([d24, d25]) => {
+      setStandings24(parse(d24));
+      setStandings25(parse(d25));
     });
   }, []);
 
@@ -1075,20 +1094,17 @@ const Predictions = ({goT, players, statsCache, setStatsCache}) => {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [players, fetchDone]);
 
-  const preds  = useMemo(() => calcPreds(players, statsCache, standings), [players, statsCache, standings]);
+  const preds  = useMemo(() => calcPreds(players, statsCache, standings24, standings25), [players, statsCache, standings24, standings25]);
   const sorted = useMemo(() => {
     const c = [...preds];
-    if (sortBy === "score")  return c.sort((a,b) => b.score - a.score);
-    if (sortBy === "p26")    return c.sort((a,b) => b.p26 - a.p26);
-    if (sortBy === "hist")   return c.sort((a,b) => b.histScore - a.histScore);
-    if (sortBy === "roster") return c.sort((a,b) => b.rosterScore - a.rosterScore);
-    if (sortBy === "sb")     return c.sort((a,b) => b.sbOdds - a.sbOdds);
-    if (sortBy === "w24")    return c.sort((a,b) => (b.actualW24||0) - (a.actualW24||0));
-    return c;
-  }, [preds, sortBy]);
+    if (yearTab === "2026") return c.sort((a,b) => b.p26 - a.p26);
+    if (yearTab === "2027") return c.sort((a,b) => b.p27 - a.p27);
+    return c.sort((a,b) => b.p28 - a.p28);
+  }, [preds, yearTab]);
 
   const tc = {Contender:"var(--lm)", Playoff:"var(--gd)", Rebuild:"var(--em)", Bottom:"var(--rs)"};
-  const hasStandings = Object.keys(standings).length > 0;
+  const hasStandings = Object.keys(standings24).length > 0 || Object.keys(standings25).length > 0;
+  const has25 = Object.keys(standings25).length > 0;
 
   const ScoreBar = ({val, max=10, color="var(--em)"}) => (
     <div style={{display:'flex', alignItems:'center', gap:7}}>
@@ -1099,32 +1115,63 @@ const Predictions = ({goT, players, statsCache, setStatsCache}) => {
     </div>
   );
 
-  const SortBtn = ({id, label}) => (
-    <button onClick={() => setSortBy(id)} style={{padding:'5px 12px', borderRadius:7, border:'none', background:sortBy===id?'var(--em)':'rgba(255,255,255,.05)', color:sortBy===id?'#000':'var(--dm)', fontWeight:sortBy===id?800:500, fontSize:12, cursor:'pointer', whiteSpace:'nowrap'}}>
-      {label}
-    </button>
-  );
-
   return <div className="fu" style={{maxWidth:1400, margin:'0 auto', padding:'24px 20px'}}>
 
     {/* Header */}
     <div style={{background:'var(--s1)', border:'1px solid var(--bd)', borderRadius:14, padding:18, marginBottom:16}}>
       <div style={{display:'flex', alignItems:'flex-start', justifyContent:'space-between', flexWrap:'wrap', gap:12}}>
         <div>
-          <h2 style={{fontFamily:"'Bebas Neue'", fontSize:26, letterSpacing:1, marginBottom:5}}>2026–2028 WIN PROJECTIONS</h2>
+          <h2 style={{fontFamily:"'Bebas Neue'", fontSize:26, letterSpacing:1, marginBottom:5}}>NFL WIN PROJECTIONS</h2>
           <p style={{color:'var(--dm)', fontSize:14, maxWidth:600, lineHeight:1.6}}>
-            <span style={{color:'var(--vi)'}}>35%</span> playoff history (2017–24) · <span style={{color:'var(--sk)'}}>45%</span> roster quality · <span style={{color:'var(--lm)'}}>20%</span> 2024 record{hasStandings ? " ✓" : " (loading…)"}.
-            Fetching key player stats automatically to power roster scores.
+            <span style={{color:'var(--vi)'}}>35%</span> history · <span style={{color:'var(--sk)'}}>45%</span> roster · <span style={{color:'var(--lm)'}}>20%</span> {has25?"2025":"2024"} record{hasStandings ? " ✓" : " (loading…)"}.
+            Mean-reversion applied — top teams trend down, rebuilds trend up.
           </p>
         </div>
-        <div style={{display:'flex', gap:5, flexWrap:'wrap', alignItems:'center'}}>
-          <span style={{fontSize:12, color:'var(--dm)', marginRight:3}}>Sort:</span>
-          <SortBtn id="score"  label="Overall"/>
-          <SortBtn id="p26"    label="2026 W"/>
-          <SortBtn id="w24"    label="2024 W"/>
-          <SortBtn id="hist"   label="History"/>
-          <SortBtn id="roster" label="Roster"/>
-          <SortBtn id="sb"     label="SB %"/>
+        {/* Season tabs + cheat-sheet info icon */}
+        <div style={{display:'flex', alignItems:'center', gap:10}}>
+          <div style={{display:'flex', gap:4}}>
+            {[["2026","26–27"],["2027","27–28"],["2028","28–29"]].map(([yr,label])=>(
+              <button key={yr} onClick={()=>setYearTab(yr)} style={{
+                padding:'8px 20px', borderRadius:8, border:'none',
+                background: yearTab===yr ? 'var(--em)' : 'rgba(255,255,255,.05)',
+                color: yearTab===yr ? '#000' : 'var(--dm)',
+                fontFamily:"'Bebas Neue'", fontSize:17, letterSpacing:1.5,
+                cursor:'pointer', fontWeight: yearTab===yr ? 900 : 500, transition:'all .15s'}}>
+                {label}
+              </button>
+            ))}
+          </div>
+          {/* ℹ cheat-sheet tooltip */}
+          <div style={{position:'relative'}} onMouseEnter={()=>setShowCheat(true)} onMouseLeave={()=>setShowCheat(false)}>
+            <button style={{width:30, height:30, borderRadius:'50%', border:'1px solid var(--sk)',
+              background:'rgba(56,189,248,.08)', color:'var(--sk)', fontSize:15, fontWeight:900,
+              cursor:'pointer', display:'flex', alignItems:'center', justifyContent:'center', lineHeight:1}}>
+              ℹ
+            </button>
+            {showCheat && (
+              <div style={{position:'absolute', top:36, right:0, zIndex:200, width:300,
+                background:'rgba(4,6,12,.98)', border:'1px solid rgba(56,189,248,.25)',
+                borderRadius:14, padding:16, boxShadow:'0 8px 40px rgba(0,0,0,.7)', pointerEvents:'none'}}>
+                <div style={{fontFamily:"'Bebas Neue'", fontSize:16, letterSpacing:1.5, color:'var(--em)', marginBottom:12}}>
+                  📊 SCORING CHEAT SHEET
+                </div>
+                {[
+                  {l:"SCORE (0–10)",    c:"var(--em)", d:"Blended rating: 35% playoff history + 45% roster quality + 20% last season record"},
+                  {l:"HISTORY",         c:"var(--vi)", d:"2017–24 playoff runs, conf. championship & SB wins — recent seasons weighted up to 3×"},
+                  {l:"ROSTER",          c:"var(--sk)", d:"Fantasy PPR averages for key starters: QB 35% · WR 30% · RB 20% · TE 15%"},
+                  {l:"QB / WR / RB",    c:"var(--gd)", d:"Per-position scores out of 10, based on each player's own 3-year weighted PPR average"},
+                  {l:"TIERS",           c:"var(--lm)", d:"Top 8 → Contender · 9–16 → Playoff · 17–26 → Rebuild · 27–32 → Bottom"},
+                  {l:"WIN PROJECTIONS", c:"var(--tx)", d:"NFL mean-reversion model anchored on 2025 record — 14-win teams trend down, 4-win teams trend up"},
+                  {l:"SB %",            c:"var(--gd)", d:"Relative Super Bowl odds based on overall score — not an absolute probability"},
+                ].map(item=>(
+                  <div key={item.l} style={{marginBottom:9}}>
+                    <div style={{color:item.c, fontSize:10, fontWeight:700, fontFamily:"'Barlow Condensed'", letterSpacing:.8, marginBottom:1}}>{item.l}</div>
+                    <div style={{color:'var(--dm)', fontSize:12, lineHeight:1.45}}>{item.d}</div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
@@ -1167,10 +1214,10 @@ const Predictions = ({goT, players, statsCache, setStatsCache}) => {
               <th style={{...th, width:110}}>History</th>
               <th style={{...th, width:110}}>Roster</th>
               <th style={{...th, width:110}}>QB / WR / RB</th>
-              <th style={{...th, width:55, textAlign:'center'}}>2024 W</th>
-              <th style={{...th, width:60, textAlign:'center'}}>2026</th>
-              <th style={{...th, width:60, textAlign:'center'}}>2027</th>
-              <th style={{...th, width:60, textAlign:'center'}}>2028</th>
+              <th style={{...th, width:62, textAlign:'center'}}>{has25 ? "2025 W" : "Last W"}</th>
+              <th style={{...th, width:62, textAlign:'center', color: yearTab==="2026"?'var(--em)':'var(--dm)', borderBottom: yearTab==="2026"?'2px solid var(--em)':'none'}}>2026</th>
+              <th style={{...th, width:62, textAlign:'center', color: yearTab==="2027"?'var(--em)':'var(--dm)', borderBottom: yearTab==="2027"?'2px solid var(--em)':'none'}}>2027</th>
+              <th style={{...th, width:62, textAlign:'center', color: yearTab==="2028"?'var(--em)':'var(--dm)', borderBottom: yearTab==="2028"?'2px solid var(--em)':'none'}}>2028</th>
               <th style={{...th, width:56, textAlign:'center'}}>SB %</th>
             </tr>
           </thead>
@@ -1218,17 +1265,25 @@ const Predictions = ({goT, players, statsCache, setStatsCache}) => {
                     </div>
                   </td>
 
-                  {/* 2024 actual record */}
+                  {/* Last season actual record (2025 if loaded, else 2024) */}
                   <td style={{...td, textAlign:'center'}}>
-                    {p.actualW24 !== null
-                      ? <span style={{fontFamily:"'Bebas Neue'", fontSize:18, color: p.actualW24>=10?'var(--lm)':p.actualW24>=7?'var(--gd)':'var(--rs)'}}>{p.actualW24}-{standings[p.ab]?.losses??""}</span>
-                      : <span style={{color:'var(--dm)', fontSize:12}}>—</span>}
+                    {p.actualW25 !== null
+                      ? <span style={{fontFamily:"'Bebas Neue'", fontSize:18, color: p.actualW25>=10?'var(--lm)':p.actualW25>=7?'var(--gd)':'var(--rs)'}}>{p.actualW25}-{standings25[p.ab]?.losses??""}</span>
+                      : p.actualW24 !== null
+                        ? <span style={{fontFamily:"'Bebas Neue'", fontSize:18, color: p.actualW24>=10?'var(--lm)':p.actualW24>=7?'var(--gd)':'var(--rs)'}}>{p.actualW24}-{standings24[p.ab]?.losses??""}</span>
+                        : <span style={{color:'var(--dm)', fontSize:12}}>—</span>}
                   </td>
 
-                  {/* Projected wins */}
-                  <td style={{...td, textAlign:'center', fontFamily:"'Bebas Neue'", fontSize:22, fontWeight:900, color:'var(--tx)'}}>{p.p26}</td>
-                  <td style={{...td, textAlign:'center', fontFamily:"'Bebas Neue'", fontSize:19, color:'var(--dm)'}}>{p.p27}</td>
-                  <td style={{...td, textAlign:'center', fontFamily:"'Bebas Neue'", fontSize:16, color:'rgba(232,236,248,.3)'}}>{p.p28}</td>
+                  {/* Projected wins — active year highlighted in orange */}
+                  <td style={{...td, textAlign:'center', fontFamily:"'Bebas Neue'",
+                    fontSize: yearTab==="2026" ? 22 : 15, fontWeight:900,
+                    color: yearTab==="2026" ? 'var(--em)' : 'rgba(232,236,248,.28)'}}>{p.p26}</td>
+                  <td style={{...td, textAlign:'center', fontFamily:"'Bebas Neue'",
+                    fontSize: yearTab==="2027" ? 22 : 15, fontWeight:900,
+                    color: yearTab==="2027" ? 'var(--em)' : 'rgba(232,236,248,.28)'}}>{p.p27}</td>
+                  <td style={{...td, textAlign:'center', fontFamily:"'Bebas Neue'",
+                    fontSize: yearTab==="2028" ? 22 : 15, fontWeight:900,
+                    color: yearTab==="2028" ? 'var(--em)' : 'rgba(232,236,248,.28)'}}>{p.p28}</td>
 
                   {/* SB donut */}
                   <td style={{...td, textAlign:'center'}}>
@@ -1245,7 +1300,7 @@ const Predictions = ({goT, players, statsCache, setStatsCache}) => {
     </div>
 
     <div style={{marginTop:12, color:'var(--dm)', fontSize:12, padding:'0 4px', lineHeight:1.7}}>
-      * History: 2017–2024 playoff results (recency-weighted) · Roster: top-player fantasy-point averages · 2024 record from ESPN standings · SB % is relative, not absolute.
+      * Hover ℹ for full scoring cheat sheet · History: 2017–2024 playoff results (recency-weighted) · Roster: top-player fantasy PPR averages · {has25 ? "2025" : "2024"} record from ESPN standings · SB % is relative, not absolute.
     </div>
   </div>;
 };
