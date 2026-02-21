@@ -256,6 +256,30 @@ async function fetchPlayerGameLog(athleteId, season = 2024) {
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  FETCH TEAM DEPTH CHART — current season official depth order
+// ═══════════════════════════════════════════════════════════════
+async function fetchTeamDepthChart(espnTeamId) {
+  // ESPN public depth chart endpoint
+  const data = await espn(`${SITE}/teams/${espnTeamId}/depthcharts`);
+  if (!data?.items) return {};
+  // Build map: position abbreviation → ordered array of athlete IDs
+  const chart = {};
+  for (const item of data.items) {
+    const pos = item.position?.abbreviation;
+    if (!pos || !OFF_POS.has(pos)) continue;
+    const ordered = (item.athletes || [])
+      .sort((a, b) => (a.rank || a.slot || 99) - (b.rank || b.slot || 99))
+      .map(a => String(a.athlete?.id || a.id || ""))
+      .filter(Boolean);
+    chart[pos] = ordered;
+  }
+  return chart;
+}
+
+// Map ESPN team abbreviation → ESPN numeric ID
+const AB_TO_TID = Object.fromEntries(Object.entries(TID).map(([k,v])=>[v,k]));
+
+// ═══════════════════════════════════════════════════════════════
 //  PLAYOFF BRACKETS 2017-2024
 // ═══════════════════════════════════════════════════════════════
 const BK = {
@@ -269,14 +293,29 @@ const BK = {
   2024:{sb:{a:"KC",h:"PHI",as:22,hs:40,mvp:"Saquon Barkley"},afc:[{rd:"WC",m:[{a:"LAC",h:"HOU",as:12,hs:32},{a:"PIT",h:"BAL",as:14,hs:28},{a:"DEN",h:"BUF",as:7,hs:31}]},{rd:"DIV",m:[{a:"HOU",h:"KC",as:14,hs:23},{a:"BAL",h:"BUF",as:25,hs:27}]},{rd:"CC",m:[{a:"BUF",h:"KC",as:29,hs:32}]}],nfc:[{rd:"WC",m:[{a:"GB",h:"PHI",as:10,hs:22},{a:"WAS",h:"TB",as:23,hs:20},{a:"MIN",h:"LAR",as:27,hs:9}]},{rd:"DIV",m:[{a:"MIN",h:"PHI",as:13,hs:28},{a:"WAS",h:"DET",as:45,hs:31}]},{rd:"CC",m:[{a:"WAS",h:"PHI",as:23,hs:55}]}]},
 };
 
-// Projected PPR by season (ESPN ADP-based averages for top players at each position)
-// These are approximate consensus projected PPR totals used as a benchmark
-const PROJ_PPR = {
-  QB:  {2017:310,2018:325,2019:330,2020:335,2021:340,2022:338,2023:345,2024:348,2025:350},
-  RB:  {2017:210,2018:215,2019:220,2020:205,2021:225,2022:218,2023:230,2024:235,2025:238},
-  WR:  {2017:195,2018:200,2019:205,2020:200,2021:215,2022:210,2023:220,2024:225,2025:228},
-  TE:  {2017:140,2018:145,2019:150,2020:148,2021:155,2022:152,2023:158,2024:160,2025:162},
-};
+// Calculate a player-specific season projected PPR using their own weighted recent history
+// (55% most-recent season, 30% year prior, 15% two years prior) — far more accurate than
+// position averages since it reflects each player's own output trend
+function calcPlayerSeasonProjection(allStats, forYear) {
+  if (!allStats) return 0;
+  // Seasons strictly before forYear, sorted newest first
+  const prior = Object.keys(allStats)
+    .map(Number)
+    .filter(y => y < forYear)
+    .sort((a, b) => b - a)
+    .slice(0, 3);
+  if (!prior.length) return 0;
+  const weights = [0.55, 0.30, 0.15];
+  let proj = 0, wt = 0;
+  for (let i = 0; i < prior.length; i++) {
+    const s = allStats[prior[i]];
+    if (s && s.fpts > 0) {
+      proj += s.fpts * weights[i];
+      wt += weights[i];
+    }
+  }
+  return wt > 0 ? Math.round(proj / wt) : 0;
+}
 
 // ═══════════════════════════════════════════════════════════════
 //  CSS
@@ -411,7 +450,7 @@ const Players = ({players,loading,sel,setSel,goT,statsCache,setStatsCache}) => {
   const chartData = seasons.map(([y,s])=>({
     year: y,
     "Fantasy Pts": s.fpts||0,
-    "Projected PPR": PROJ_PPR[pl?.pos]?.[y] || 0,
+    "Projected PPR": calcPlayerSeasonProjection(stats, +y),
     "Pass Yds": s.passYd||0,
     "Pass TD": s.passTD||0,
     "Rush Yds": s.rushYd||0,
@@ -605,10 +644,41 @@ const Players = ({players,loading,sel,setSel,goT,statsCache,setStatsCache}) => {
 // ═══════════════════════════════════════════════════════════════
 const Teams = ({sel,setSel,players,goP}) => {
   const[conf,setConf]=useState("ALL");
+  const[depthChart,setDepthChart]=useState({});
+  const[loadingDepth,setLoadingDepth]=useState(false);
   const t = TM[sel];
   const roster = players.filter(p=>p.tm===sel);
   const afcT = new Set(ALL_AB.filter(ab=>TM[ab].conf==="AFC"));
   const filt = conf==="ALL"?ALL_AB:ALL_AB.filter(ab=>conf==="AFC"?afcT.has(ab):!afcT.has(ab));
+
+  // Fetch real depth chart when team changes
+  useEffect(()=>{
+    if(!sel) return;
+    const tid = AB_TO_TID[sel];
+    if(!tid) return;
+    setLoadingDepth(true);
+    setDepthChart({});
+    fetchTeamDepthChart(tid).then(chart=>{
+      setDepthChart(chart||{});
+      setLoadingDepth(false);
+    }).catch(()=>setLoadingDepth(false));
+  },[sel]);
+
+  // Sort a position group using depth chart order; fall back to jersey # sort
+  const sortByDepth = (group, pos) => {
+    const order = depthChart[pos];
+    if (order && order.length > 0) {
+      return [...group].sort((a,b)=>{
+        const ai = order.indexOf(String(a.id));
+        const bi = order.indexOf(String(b.id));
+        if (ai === -1 && bi === -1) return (+a.n||99)-(+b.n||99);
+        if (ai === -1) return 1;
+        if (bi === -1) return -1;
+        return ai - bi;
+      });
+    }
+    return [...group].sort((a,b)=>(+a.n||99)-(+b.n||99));
+  };
 
   return <div className="fu" style={{maxWidth:1400,margin:'0 auto',padding:'24px 20px'}}><div style={{display:'grid',gridTemplateColumns:'280px 1fr',gap:18}}>
     <div>
@@ -619,20 +689,30 @@ const Teams = ({sel,setSel,players,goP}) => {
     </div>
     <div>{!t?<div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:14,padding:60,textAlign:'center'}}><h2 style={{fontFamily:"'Bebas Neue'",fontSize:22}}>SELECT A TEAM</h2></div>:
       <div className="fu">
-        <div style={{background:`linear-gradient(135deg,${t.c1}20,var(--s1))`,border:'1px solid var(--bd)',borderRadius:14,padding:18,marginBottom:12,display:'flex',alignItems:'center',gap:16}}><Logo ab={sel} sz={64}/><div><h2 style={{fontFamily:"'Bebas Neue'",fontSize:32,letterSpacing:2}}>{t.c} {t.n}</h2><div style={{color:'var(--dm)',fontSize:14}}>{t.conf} {t.div} • {roster.length} offensive players</div></div></div>
+        <div style={{background:`linear-gradient(135deg,${t.c1}20,var(--s1))`,border:'1px solid var(--bd)',borderRadius:14,padding:18,marginBottom:12,display:'flex',alignItems:'center',gap:16}}>
+          <Logo ab={sel} sz={64}/>
+          <div style={{flex:1}}>
+            <h2 style={{fontFamily:"'Bebas Neue'",fontSize:32,letterSpacing:2}}>{t.c} {t.n}</h2>
+            <div style={{color:'var(--dm)',fontSize:14}}>{t.conf} {t.div} • {roster.length} offensive players</div>
+          </div>
+          {loadingDepth
+            ? <span style={{color:'var(--dm)',fontSize:11,fontStyle:'italic'}}>Loading depth chart…</span>
+            : Object.keys(depthChart).length > 0
+              ? <Pil ch="OFFICIAL DEPTH CHART" c="var(--lm)" s={{fontSize:10}}/>
+              : <Pil ch="DEPTH BY ROSTER ORDER" c="var(--dm)" s={{fontSize:10}}/>
+          }
+        </div>
         {["QB","RB","WR","TE"].map(pos=>{
           const group = roster.filter(p=>p.pos===pos);
           if (!group.length) return null;
-          // Sort by jersey number ascending as a proxy for depth order
-          const sorted = [...group].sort((a,b)=>(+a.n||99)-(+b.n||99));
+          const sorted = sortByDepth(group, pos);
           return <div key={pos} style={{marginBottom:14}}>
             <div style={{fontFamily:"'Bebas Neue'",fontSize:16,letterSpacing:1,marginBottom:8,color:posColor(pos)}}>{pos}s ({group.length})</div>
             <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(220px,1fr))',gap:8}}>
               {sorted.map((p,idx)=>{
                 const depthLbl = (DEPTH_LABEL[pos]||[])[idx] || `${pos}${idx+1}`;
                 return <div key={p.id} onClick={()=>goP(p.id)} style={{display:'flex',alignItems:'center',gap:10,padding:'10px 12px',borderRadius:10,cursor:'pointer',background:'rgba(0,0,0,.2)',border:'1px solid var(--bd)',transition:'all .12s',position:'relative'}} onMouseEnter={e=>e.currentTarget.style.borderColor=t.c1} onMouseLeave={e=>e.currentTarget.style.borderColor='var(--bd)'}>
-                  {/* Depth label badge */}
-                  <div style={{position:'absolute',top:6,right:8,background:`${posColor(pos)}22`,border:`1px solid ${posColor(pos)}44`,color:posColor(pos),fontSize:10,fontWeight:800,fontFamily:"'Bebas Neue'",letterSpacing:.5,padding:'1px 6px',borderRadius:5}}>{depthLbl}</div>
+                  <div style={{position:'absolute',top:6,right:8,background:`${posColor(pos)}22`,border:`1px solid ${posColor(pos)}44`,color:posColor(pos),fontSize:11,fontWeight:800,fontFamily:"'Bebas Neue'",letterSpacing:.5,padding:'2px 7px',borderRadius:5}}>{depthLbl}</div>
                   <Hs src={p.hs} sz={38}/>
                   <div>
                     <div style={{fontWeight:700,fontSize:14}}>{p.nm}</div>
@@ -703,6 +783,23 @@ const GamesFetch = ({goT}) => {
         const wxGust = wx?.windGust != null ? `${Math.round(wx.windGust)} mph gusts` : null;
         const wxHumid = wx?.humidity != null ? `${wx.humidity}% humidity` : null;
 
+        // Notable players: ESPN scoreboard leaders (passing, rushing, receiving)
+        const leaders = c.leaders || [];
+        const statLeaders = leaders
+          .filter(l => ["passingYards","rushingYards","receivingYards"].includes(l.name))
+          .map(l => {
+            const top = l.leaders?.[0];
+            if (!top) return null;
+            const ath = top.athlete || top;
+            return {
+              cat: l.shortDisplayName || l.displayName || l.name,
+              name: ath.displayName || ath.fullName || "Unknown",
+              hs: ath.headshot?.href || HEAD(ath.id),
+              val: top.displayValue || String(Math.round(top.value||0)),
+              color: l.name==="passingYards"?"var(--em)":l.name==="rushingYards"?"var(--lm)":"var(--sk)",
+            };
+          }).filter(Boolean);
+
         return<div key={g.id} style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:14,padding:16}}>
           <div style={{display:'flex',justifyContent:'space-between',marginBottom:10,flexWrap:'wrap',gap:5}}>
             <Pil ch={g.shortName||g.name||`Week ${wk}`} c="var(--sk)"/><span style={{color:'var(--dm)',fontSize:13}}>{g.date?new Date(g.date).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}):''}</span>
@@ -723,6 +820,24 @@ const GamesFetch = ({goT}) => {
             </div>}
             {!wx && c.venue && !c.venue.indoor && <span style={{color:'var(--dm)',fontSize:11,fontStyle:'italic'}}>Weather unavailable</span>}
           </div>
+          {/* Notable player leaders */}
+          {statLeaders.length > 0 && (
+            <div style={{marginTop:12,paddingTop:10,borderTop:'1px solid var(--bd)'}}>
+              <div style={{fontSize:10,color:'var(--dm)',fontWeight:700,textTransform:'uppercase',letterSpacing:1,marginBottom:8,fontFamily:"'Barlow Condensed'"}}>Notable Performers</div>
+              <div style={{display:'flex',gap:10,flexWrap:'wrap'}}>
+                {statLeaders.map((ldr,i)=>(
+                  <div key={i} style={{display:'flex',alignItems:'center',gap:8,background:'rgba(0,0,0,.25)',border:`1px solid ${ldr.color}22`,borderRadius:10,padding:'6px 10px',flex:'1 1 180px',minWidth:160}}>
+                    <img src={ldr.hs} alt={ldr.name} width={40} height={40} style={{borderRadius:'50%',objectFit:'cover',border:`2px solid ${ldr.color}44`,flexShrink:0,background:'var(--s2)'}} onError={e=>{e.target.style.opacity='.3'}}/>
+                    <div style={{minWidth:0}}>
+                      <div style={{fontWeight:700,fontSize:13,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{ldr.name}</div>
+                      <div style={{fontSize:11,color:'var(--dm)',marginBottom:1}}>{ldr.cat}</div>
+                      <div style={{fontFamily:"'Bebas Neue'",fontSize:18,color:ldr.color,letterSpacing:.5,lineHeight:1}}>{ldr.val}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>;
       })}
       {!loading&&games.length===0&&<div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:14,padding:36,textAlign:'center',color:'var(--dm)'}}>No games found for this selection.</div>}
@@ -1051,7 +1166,7 @@ const Predictions = ({goT, players, statsCache, setStatsCache}) => {
               <th style={{...th, width:130}}>Score</th>
               <th style={{...th, width:110}}>History</th>
               <th style={{...th, width:110}}>Roster</th>
-              <th style={{...th, width:95}}>QB/WR/RB</th>
+              <th style={{...th, width:110}}>QB / WR / RB</th>
               <th style={{...th, width:55, textAlign:'center'}}>2024 W</th>
               <th style={{...th, width:60, textAlign:'center'}}>2026</th>
               <th style={{...th, width:60, textAlign:'center'}}>2027</th>
@@ -1087,10 +1202,19 @@ const Predictions = ({goT, players, statsCache, setStatsCache}) => {
                   <td style={td}><ScoreBar val={p.rosterScore} color="var(--sk)"/></td>
 
                   <td style={td}>
-                    <div style={{display:'flex', gap:4}}>
-                      <span style={{background:'rgba(249,115,22,.15)', color:'var(--em)', borderRadius:5, padding:'2px 6px', fontSize:10, fontWeight:700, fontFamily:"'Bebas Neue'", letterSpacing:.5}}>QB {p.qbScore}</span>
-                      <span style={{background:'rgba(56,189,248,.15)',  color:'var(--sk)', borderRadius:5, padding:'2px 6px', fontSize:10, fontWeight:700, fontFamily:"'Bebas Neue'", letterSpacing:.5}}>WR {p.wrScore}</span>
-                      <span style={{background:'rgba(34,197,94,.15)',   color:'var(--lm)', borderRadius:5, padding:'2px 6px', fontSize:10, fontWeight:700, fontFamily:"'Bebas Neue'", letterSpacing:.5}}>RB {p.rbScore}</span>
+                    <div style={{display:'flex', flexDirection:'column', gap:4, minWidth:90}}>
+                      <div style={{display:'flex', alignItems:'center', justifyContent:'space-between', background:'rgba(249,115,22,.12)', border:'1px solid rgba(249,115,22,.25)', borderRadius:6, padding:'3px 8px'}}>
+                        <span style={{color:'var(--em)', fontSize:11, fontWeight:700, fontFamily:"'Barlow Condensed'", letterSpacing:.5}}>QB</span>
+                        <span style={{color:'var(--em)', fontSize:13, fontWeight:900, fontFamily:"'Bebas Neue'", letterSpacing:.5}}>{p.qbScore}</span>
+                      </div>
+                      <div style={{display:'flex', alignItems:'center', justifyContent:'space-between', background:'rgba(56,189,248,.12)', border:'1px solid rgba(56,189,248,.25)', borderRadius:6, padding:'3px 8px'}}>
+                        <span style={{color:'var(--sk)', fontSize:11, fontWeight:700, fontFamily:"'Barlow Condensed'", letterSpacing:.5}}>WR</span>
+                        <span style={{color:'var(--sk)', fontSize:13, fontWeight:900, fontFamily:"'Bebas Neue'", letterSpacing:.5}}>{p.wrScore}</span>
+                      </div>
+                      <div style={{display:'flex', alignItems:'center', justifyContent:'space-between', background:'rgba(34,197,94,.12)', border:'1px solid rgba(34,197,94,.25)', borderRadius:6, padding:'3px 8px'}}>
+                        <span style={{color:'var(--lm)', fontSize:11, fontWeight:700, fontFamily:"'Barlow Condensed'", letterSpacing:.5}}>RB</span>
+                        <span style={{color:'var(--lm)', fontSize:13, fontWeight:900, fontFamily:"'Bebas Neue'", letterSpacing:.5}}>{p.rbScore}</span>
+                      </div>
                     </div>
                   </td>
 
