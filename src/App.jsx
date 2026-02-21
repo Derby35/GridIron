@@ -94,9 +94,6 @@ function parseWebStats(data) {
   if (!data) return null;
   const seasons = {};
 
-  // The stats endpoint returns categories with seasonTypes
-  // Each category has a displayName (Passing, Rushing, Receiving, etc.)
-  // We prefix stats by category to avoid collisions (e.g. YDS appears in passing AND receiving)
   if (data.categories) {
     for (const cat of data.categories) {
       const names = cat.names || [];
@@ -110,7 +107,6 @@ function parseWebStats(data) {
           if (!seasons[yr]) seasons[yr] = {};
           const stats = sc.stats || [];
           for (let i = 0; i < names.length && i < stats.length; i++) {
-            // Store with the exact API name (no collision since names are category-specific)
             seasons[yr][names[i]] = parseFloat(stats[i]) || 0;
           }
         }
@@ -118,7 +114,6 @@ function parseWebStats(data) {
     }
   }
 
-  // Normalize stat names
   return normalizeStats(seasons);
 }
 
@@ -126,7 +121,6 @@ function parseOverviewStats(data) {
   if (!data) return null;
   const seasons = {};
 
-  // Try to find stats in various locations
   const statsSections = [
     data?.stats, data?.statistics, data?.seasonStats,
     data?.player?.stats, data?.athlete?.stats
@@ -140,7 +134,6 @@ function parseOverviewStats(data) {
           if (yr < 2017) continue;
           if (!seasons[yr]) seasons[yr] = {};
           if (Array.isArray(item.stats)) {
-            // Use names (API field names) not labels (display abbreviations) to avoid collisions
             const names = item.names || item.labels || [];
             for (let i = 0; i < names.length; i++) {
               seasons[yr][names[i]] = parseFloat(item.stats[i]) || 0;
@@ -158,7 +151,6 @@ function parseOverviewStats(data) {
 
 async function fetchPerSeasonStats(athleteId) {
   const seasons = {};
-  // Fetch regular season stats for each year (seasontype 2 = regular season)
   const calls = SEASONS.map(yr =>
     espn(`${CORE}/seasons/${yr}/types/2/athletes/${athleteId}/statistics`)
       .then(d => ({ yr, d }))
@@ -169,13 +161,11 @@ async function fetchPerSeasonStats(athleteId) {
     if (r.status !== "fulfilled" || !r.value?.d) continue;
     const { yr, d } = r.value;
     const raw = {};
-    // Core API returns splits.categories[] each with stats[{name, value}]
     const cats = d?.splits?.categories || d?.categories || [];
     for (const cat of cats) {
       const statList = cat.stats || [];
       for (const s of statList) {
         if (s.name && s.value !== undefined && s.value !== null) {
-          // Don't overwrite an existing non-zero value with zero
           const val = parseFloat(s.value) || 0;
           if (val !== 0 || raw[s.name] === undefined) {
             raw[s.name] = val;
@@ -192,39 +182,77 @@ function normalizeStats(seasons) {
   const norm = {};
   for (const [yr, raw] of Object.entries(seasons)) {
     const s = {};
-    // Games — ESPN core API uses "gamesPlayed"
     s.gp = raw.gamesPlayed || 0;
-    // Passing — exact ESPN field names from both web and core API
     s.passYd = raw.passingYards || raw.netPassingYards || 0;
     s.passTD = raw.passingTouchdowns || 0;
     s.passInt = raw.interceptions || 0;
     s.passCmp = raw.completions || 0;
     s.passAtt = raw.passingAttempts || raw.netPassingAttempts || 0;
     s.passRat = raw.QBRating || raw.quarterbackRating || raw.ESPNQBRating || 0;
-    // Rushing — exact ESPN field names
     s.rushYd = raw.rushingYards || 0;
     s.rushTD = raw.rushingTouchdowns || 0;
     s.rushAtt = raw.rushingAttempts || 0;
-    // Receiving — exact ESPN field names
     s.rec = raw.receptions || 0;
     s.recYd = raw.receivingYards || 0;
     s.recTD = raw.receivingTouchdowns || 0;
     s.tgt = raw.receivingTargets || 0;
-    // Fumbles — ESPN uses "fumbles" at general level, or category-specific lost
     s.fum = raw.fumblesLost || raw.passingFumblesLost || raw.rushingFumblesLost || raw.receivingFumblesLost || raw.fumbles || 0;
-    // Calculate fantasy points (PPR)
     s.fpts = Math.round(
       (s.passYd * 0.04) + (s.passTD * 4) + (s.passInt * -2) +
       (s.rushYd * 0.1) + (s.rushTD * 6) +
       (s.rec * 1) + (s.recYd * 0.1) + (s.recTD * 6) +
       (s.fum * -2)
     );
-    // Only include seasons where player actually played
     if (s.gp > 0 || s.passYd > 0 || s.rushYd > 0 || s.recYd > 0 || s.fpts > 0) {
       norm[yr] = s;
     }
   }
   return norm;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  FETCH PLAYER GAME LOG — for matchup chart
+// ═══════════════════════════════════════════════════════════════
+async function fetchPlayerGameLog(athleteId, season = 2024) {
+  const data = await espn(`${SITE}/athletes/${athleteId}/gamelog?season=${season}`);
+  if (!data) return [];
+
+  const games = [];
+  const events = data.events || {};
+  const labels = data.labels || [];
+  const names  = data.names  || labels;
+
+  // Map category-level stat names
+  const cats = data.seasonTypes || [];
+  for (const st of cats) {
+    if (st.type !== 2 && st.seasonType !== 2) continue; // regular season only
+    const catNames = st.names || names;
+    for (const ev of (st.events || [])) {
+      const statsArr = ev.stats || [];
+      const raw = {};
+      for (let i = 0; i < catNames.length && i < statsArr.length; i++) {
+        raw[catNames[i]] = parseFloat(statsArr[i]) || 0;
+      }
+      const opp = ev.opponent?.abbreviation || ev.opponent?.displayName || "?";
+      const rec = raw.receptions || 0;
+      const recYd = raw.receivingYards || 0;
+      const recTD = raw.receivingTouchdowns || 0;
+      const rushYd = raw.rushingYards || 0;
+      const rushTD = raw.rushingTouchdowns || 0;
+      const passYd = raw.passingYards || 0;
+      const passTD = raw.passingTouchdowns || 0;
+      const passInt = raw.interceptions || 0;
+      const fpts = Math.round(
+        (passYd*0.04)+(passTD*4)+(passInt*-2)+
+        (rushYd*0.1)+(rushTD*6)+
+        (rec*1)+(recYd*0.1)+(recTD*6)
+      );
+      if (opp !== "?" && (fpts > 0 || recYd > 0 || rushYd > 0 || passYd > 0)) {
+        games.push({ opp, fpts, rec, recYd, recTD, rushYd, rushTD, passYd, passTD, passInt });
+      }
+    }
+  }
+  return games;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -241,45 +269,64 @@ const BK = {
   2024:{sb:{a:"KC",h:"PHI",as:22,hs:40,mvp:"Saquon Barkley"},afc:[{rd:"WC",m:[{a:"LAC",h:"HOU",as:12,hs:32},{a:"PIT",h:"BAL",as:14,hs:28},{a:"DEN",h:"BUF",as:7,hs:31}]},{rd:"DIV",m:[{a:"HOU",h:"KC",as:14,hs:23},{a:"BAL",h:"BUF",as:25,hs:27}]},{rd:"CC",m:[{a:"BUF",h:"KC",as:29,hs:32}]}],nfc:[{rd:"WC",m:[{a:"GB",h:"PHI",as:10,hs:22},{a:"WAS",h:"TB",as:23,hs:20},{a:"MIN",h:"LAR",as:27,hs:9}]},{rd:"DIV",m:[{a:"MIN",h:"PHI",as:13,hs:28},{a:"WAS",h:"DET",as:45,hs:31}]},{rd:"CC",m:[{a:"WAS",h:"PHI",as:23,hs:55}]}]},
 };
 
+// Projected PPR by season (ESPN ADP-based averages for top players at each position)
+// These are approximate consensus projected PPR totals used as a benchmark
+const PROJ_PPR = {
+  QB:  {2017:310,2018:325,2019:330,2020:335,2021:340,2022:338,2023:345,2024:348,2025:350},
+  RB:  {2017:210,2018:215,2019:220,2020:205,2021:225,2022:218,2023:230,2024:235,2025:238},
+  WR:  {2017:195,2018:200,2019:205,2020:200,2021:215,2022:210,2023:220,2024:225,2025:228},
+  TE:  {2017:140,2018:145,2019:150,2020:148,2021:155,2022:152,2023:158,2024:160,2025:162},
+};
+
 // ═══════════════════════════════════════════════════════════════
 //  CSS
 // ═══════════════════════════════════════════════════════════════
 const CSS = `@import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Barlow:wght@300;400;500;600;700;800;900&family=Barlow+Condensed:wght@400;600;700&display=swap');
 :root{--bg:#04060C;--s1:#0A0F1E;--s2:#0F1628;--bd:rgba(255,255,255,.06);--tx:#E8ECF8;--dm:rgba(232,236,248,.45);--em:#F97316;--gd:#F59E0B;--lm:#22C55E;--sk:#38BDF8;--rs:#F43F5E;--vi:#A78BFA}
-*{box-sizing:border-box;margin:0;padding:0}body{background:var(--bg);color:var(--tx);font-family:'Barlow',sans-serif}
-::-webkit-scrollbar{width:6px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:rgba(255,255,255,.1);border-radius:3px}
+*{box-sizing:border-box;margin:0;padding:0}
+html{font-size:16px}
+body{background:var(--bg);color:var(--tx);font-family:'Barlow',sans-serif;font-size:15px;line-height:1.5}
+::-webkit-scrollbar{width:7px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:rgba(255,255,255,.1);border-radius:4px}
 @keyframes fu{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}.fu{animation:fu .4s ease-out both}
 @keyframes spin{to{transform:rotate(360deg)}}.spin{animation:spin .8s linear infinite}
 .logo{border-radius:50%;object-fit:contain;background:rgba(255,255,255,.03)}
 .hs{border-radius:50%;object-fit:cover;border:2px solid var(--bd);background:linear-gradient(135deg,var(--s1),var(--s2))}
-.recharts-cartesian-axis-tick-value{fill:rgba(232,236,248,.4)!important;font-size:11px!important}
-.recharts-legend-item-text{color:var(--tx)!important;font-size:11px!important}`;
+.recharts-cartesian-axis-tick-value{fill:rgba(232,236,248,.5)!important;font-size:13px!important}
+.recharts-legend-item-text{color:var(--tx)!important;font-size:13px!important}`;
 
 // ═══════════════════════════════════════════════════════════════
 //  SMALL COMPONENTS
 // ═══════════════════════════════════════════════════════════════
-const Logo = ({ab,sz=36,onClick}) => <img src={`${IMG}/${ab?.toLowerCase()}.png`} alt={ab} width={sz} height={sz} className="logo" style={{cursor:onClick?'pointer':'default',flexShrink:0}} onClick={onClick} onError={e=>{e.target.style.opacity='.3'}}/>;
-const Hs = ({src,sz=48}) => <img src={src} alt="" width={sz} height={sz} className="hs" onError={e=>{e.target.style.background='linear-gradient(135deg,#1a1a2e,#16213e)';e.target.src=''}}/>;
-const Pil = ({ch,c="var(--em)",s={}}) => <span style={{display:'inline-flex',alignItems:'center',padding:'3px 9px',borderRadius:999,background:`${c}15`,border:`1px solid ${c}33`,color:c,fontSize:11,fontWeight:700,letterSpacing:.5,...s}}>{ch}</span>;
-const StCard = ({l,v,c="var(--em)"}) => <div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:10,padding:'8px 12px',flex:1,minWidth:75,borderTop:`3px solid ${c}`}}><div style={{color:'var(--dm)',fontSize:10,textTransform:'uppercase',letterSpacing:.8,fontFamily:"'Barlow Condensed'"}}>{l}</div><div style={{fontSize:20,fontWeight:900,fontFamily:"'Bebas Neue'",color:c,marginTop:2,letterSpacing:1}}>{v ?? "—"}</div></div>;
-const TT = ({active,payload,label}) => {if(!active||!payload?.length)return null;return<div style={{background:'rgba(4,6,12,.95)',border:'1px solid var(--bd)',borderRadius:8,padding:'6px 10px',fontSize:11}}><div style={{fontWeight:700,color:'var(--em)',marginBottom:2}}>{label}</div>{payload.map((p,i)=><div key={i} style={{display:'flex',gap:4,alignItems:'center'}}><div style={{width:6,height:6,borderRadius:'50%',background:p.color||p.stroke}}/><span style={{color:'var(--dm)'}}>{p.name}:</span><span style={{fontWeight:700}}>{typeof p.value==='number'?p.value.toLocaleString():p.value}</span></div>)}</div>};
-const Spinner = ({msg="Loading..."}) => <div style={{display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',padding:60,gap:12}}><div className="spin" style={{width:32,height:32,border:'3px solid var(--bd)',borderTopColor:'var(--em)',borderRadius:'50%'}}/><span style={{color:'var(--dm)',fontSize:12}}>{msg}</span></div>;
-const th = {padding:'5px 6px',textAlign:'left',color:'var(--dm)',fontWeight:600,fontSize:9,textTransform:'uppercase',letterSpacing:.5,fontFamily:"'Barlow Condensed'"};
-const td = {padding:'5px 6px',textAlign:'left',fontSize:11};
+const Logo = ({ab,sz=40,onClick}) => <img src={`${IMG}/${ab?.toLowerCase()}.png`} alt={ab} width={sz} height={sz} className="logo" style={{cursor:onClick?'pointer':'default',flexShrink:0}} onClick={onClick} onError={e=>{e.target.style.opacity='.3'}}/>;
+const Hs = ({src,sz=52}) => <img src={src} alt="" width={sz} height={sz} className="hs" onError={e=>{e.target.style.background='linear-gradient(135deg,#1a1a2e,#16213e)';e.target.src=''}}/>;
+const Pil = ({ch,c="var(--em)",s={}}) => <span style={{display:'inline-flex',alignItems:'center',padding:'4px 11px',borderRadius:999,background:`${c}15`,border:`1px solid ${c}33`,color:c,fontSize:12,fontWeight:700,letterSpacing:.5,...s}}>{ch}</span>;
+const StCard = ({l,v,c="var(--em)"}) => <div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:12,padding:'11px 15px',flex:1,minWidth:85,borderTop:`3px solid ${c}`}}><div style={{color:'var(--dm)',fontSize:11,textTransform:'uppercase',letterSpacing:.8,fontFamily:"'Barlow Condensed'"}}>{l}</div><div style={{fontSize:24,fontWeight:900,fontFamily:"'Bebas Neue'",color:c,marginTop:3,letterSpacing:1}}>{v ?? "—"}</div></div>;
+const TT = ({active,payload,label}) => {if(!active||!payload?.length)return null;return<div style={{background:'rgba(4,6,12,.95)',border:'1px solid var(--bd)',borderRadius:10,padding:'8px 12px',fontSize:13}}><div style={{fontWeight:700,color:'var(--em)',marginBottom:3}}>{label}</div>{payload.map((p,i)=><div key={i} style={{display:'flex',gap:5,alignItems:'center'}}><div style={{width:7,height:7,borderRadius:'50%',background:p.color||p.stroke}}/><span style={{color:'var(--dm)'}}>{p.name}:</span><span style={{fontWeight:700}}>{typeof p.value==='number'?p.value.toLocaleString():p.value}</span></div>)}</div>};
+const Spinner = ({msg="Loading..."}) => <div style={{display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',padding:70,gap:14}}><div className="spin" style={{width:36,height:36,border:'3px solid var(--bd)',borderTopColor:'var(--em)',borderRadius:'50%'}}/><span style={{color:'var(--dm)',fontSize:14}}>{msg}</span></div>;
+const th = {padding:'7px 8px',textAlign:'left',color:'var(--dm)',fontWeight:600,fontSize:11,textTransform:'uppercase',letterSpacing:.5,fontFamily:"'Barlow Condensed'"};
+const td = {padding:'7px 8px',textAlign:'left',fontSize:13};
 const posColor = p => p==="QB"?"var(--em)":p==="RB"?"var(--lm)":p==="WR"?"var(--sk)":"var(--vi)";
+
+// Depth label per position index (0-based)
+const DEPTH_LABEL = {
+  QB: ["QB1","QB2","QB3"],
+  RB: ["RB1","RB2","RB3","RB4"],
+  WR: ["WR1","WR2","WR3","WR4","WR5"],
+  TE: ["TE1","TE2","TE3"],
+};
 
 // ═══════════════════════════════════════════════════════════════
 //  NAV
 // ═══════════════════════════════════════════════════════════════
 const TABS = ["Home","Players","Teams","Games","Brackets","Predictions"];
 const Nav = ({tab,go}) => (
-  <div style={{position:'sticky',top:0,zIndex:50,background:'rgba(4,6,12,.82)',backdropFilter:'blur(18px)',borderBottom:'1px solid var(--bd)'}}>
-    <div style={{maxWidth:1320,margin:'0 auto',display:'flex',alignItems:'center',justifyContent:'space-between',padding:'0 16px',height:52}}>
-      <div style={{display:'flex',alignItems:'center',gap:8,cursor:'pointer'}} onClick={()=>go("Home")}>
-        <div style={{width:30,height:30,borderRadius:8,background:'linear-gradient(135deg,var(--em),var(--gd))',display:'flex',alignItems:'center',justifyContent:'center',fontFamily:"'Bebas Neue'",fontSize:14,color:'#000'}}>GI</div>
-        <span style={{fontFamily:"'Bebas Neue'",fontSize:18,letterSpacing:2}}>GRIDIRON <span style={{color:'var(--em)'}}>INTEL</span></span>
+  <div style={{position:'sticky',top:0,zIndex:50,background:'rgba(4,6,12,.85)',backdropFilter:'blur(18px)',borderBottom:'1px solid var(--bd)'}}>
+    <div style={{maxWidth:1400,margin:'0 auto',display:'flex',alignItems:'center',justifyContent:'space-between',padding:'0 20px',height:58}}>
+      <div style={{display:'flex',alignItems:'center',gap:9,cursor:'pointer'}} onClick={()=>go("Home")}>
+        <div style={{width:34,height:34,borderRadius:9,background:'linear-gradient(135deg,var(--em),var(--gd))',display:'flex',alignItems:'center',justifyContent:'center',fontFamily:"'Bebas Neue'",fontSize:16,color:'#000'}}>GI</div>
+        <span style={{fontFamily:"'Bebas Neue'",fontSize:20,letterSpacing:2}}>GRIDIRON <span style={{color:'var(--em)'}}>INTEL</span></span>
       </div>
-      <div style={{display:'flex',gap:2,flexWrap:'wrap'}}>{TABS.map(t=><button key={t} onClick={()=>go(t)} style={{padding:'6px 13px',borderRadius:7,border:'none',background:tab===t?'var(--em)':'transparent',color:tab===t?'#000':'var(--tx)',fontWeight:tab===t?800:500,fontSize:12,cursor:'pointer',fontFamily:"'Barlow'"}}>{t}</button>)}</div>
+      <div style={{display:'flex',gap:3,flexWrap:'wrap'}}>{TABS.map(t=><button key={t} onClick={()=>go(t)} style={{padding:'7px 16px',borderRadius:8,border:'none',background:tab===t?'var(--em)':'transparent',color:tab===t?'#000':'var(--tx)',fontWeight:tab===t?800:500,fontSize:14,cursor:'pointer',fontFamily:"'Barlow'"}}>{t}</button>)}</div>
     </div>
   </div>
 );
@@ -288,24 +335,24 @@ const Nav = ({tab,go}) => (
 //  HOME
 // ═══════════════════════════════════════════════════════════════
 const Home = ({go,goT,players,loading}) => (
-  <div className="fu" style={{maxWidth:1320,margin:'0 auto',padding:'20px 16px'}}>
-    <div style={{borderRadius:20,padding:'40px 36px',marginBottom:20,background:'linear-gradient(135deg,rgba(249,115,22,.1),rgba(56,189,248,.06),rgba(4,6,12,.95))',border:'1px solid rgba(249,115,22,.12)'}}>
-      <Pil ch="LIVE ESPN API • ALL ACTIVE PLAYERS • 2017-2025" c="var(--gd)" s={{marginBottom:14,display:'inline-flex'}}/>
-      <h1 style={{fontFamily:"'Bebas Neue'",fontSize:46,lineHeight:1,letterSpacing:2,marginBottom:8}}>NFL Fantasy Football<br/><span style={{color:'var(--em)'}}>Intelligence Hub</span></h1>
-      <p style={{color:'var(--dm)',fontSize:15,maxWidth:600,lineHeight:1.5,marginBottom:20}}>Dynamically pulling every active QB, RB, WR, and TE from all 32 NFL rosters via the ESPN Public API. Click any player to fetch their full career stats with interactive charts.</p>
-      <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
-        {TABS.slice(1).map((t,i)=><button key={t} onClick={()=>go(t)} style={{padding:'10px 22px',borderRadius:10,border:i===0?'none':'1px solid var(--bd)',background:i===0?'linear-gradient(135deg,var(--em),var(--gd))':'rgba(255,255,255,.04)',color:i===0?'#000':'var(--tx)',fontWeight:800,fontSize:13,cursor:'pointer'}}>{t}</button>)}
+  <div className="fu" style={{maxWidth:1400,margin:'0 auto',padding:'24px 20px'}}>
+    <div style={{borderRadius:22,padding:'48px 40px',marginBottom:24,background:'linear-gradient(135deg,rgba(249,115,22,.1),rgba(56,189,248,.06),rgba(4,6,12,.95))',border:'1px solid rgba(249,115,22,.12)'}}>
+      <Pil ch="LIVE ESPN API • ALL ACTIVE PLAYERS • 2017-2025" c="var(--gd)" s={{marginBottom:16,display:'inline-flex'}}/>
+      <h1 style={{fontFamily:"'Bebas Neue'",fontSize:54,lineHeight:1,letterSpacing:2,marginBottom:10}}>NFL Fantasy Football<br/><span style={{color:'var(--em)'}}>Intelligence Hub</span></h1>
+      <p style={{color:'var(--dm)',fontSize:17,maxWidth:640,lineHeight:1.6,marginBottom:24}}>Dynamically pulling every active QB, RB, WR, and TE from all 32 NFL rosters via the ESPN Public API. Click any player to fetch their full career stats with interactive charts.</p>
+      <div style={{display:'flex',gap:10,flexWrap:'wrap'}}>
+        {TABS.slice(1).map((t,i)=><button key={t} onClick={()=>go(t)} style={{padding:'12px 26px',borderRadius:11,border:i===0?'none':'1px solid var(--bd)',background:i===0?'linear-gradient(135deg,var(--em),var(--gd))':'rgba(255,255,255,.04)',color:i===0?'#000':'var(--tx)',fontWeight:800,fontSize:15,cursor:'pointer'}}>{t}</button>)}
       </div>
     </div>
-    <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:10,marginBottom:20}}>
+    <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:12,marginBottom:24}}>
       <StCard l="Active Players" v={loading?"...":players.length} c="var(--em)"/>
       <StCard l="QBs" v={loading?"...":players.filter(p=>p.pos==="QB").length} c="var(--gd)"/>
       <StCard l="RBs + WRs" v={loading?"...":(players.filter(p=>p.pos==="RB").length+"+"+players.filter(p=>p.pos==="WR").length)} c="var(--sk)"/>
       <StCard l="TEs" v={loading?"...":players.filter(p=>p.pos==="TE").length} c="var(--vi)"/>
     </div>
-    <h2 style={{fontFamily:"'Bebas Neue'",fontSize:20,letterSpacing:1,marginBottom:10}}>ALL 32 TEAMS</h2>
-    <div style={{display:'grid',gridTemplateColumns:'repeat(8,1fr)',gap:8,marginBottom:20}}>
-      {ALL_AB.map(ab=><div key={ab} onClick={()=>goT(ab)} style={{display:'flex',flexDirection:'column',alignItems:'center',gap:3,padding:'8px 4px',borderRadius:12,border:'1px solid var(--bd)',background:'var(--s1)',cursor:'pointer',transition:'all .2s'}} onMouseEnter={e=>{e.currentTarget.style.borderColor=TM[ab].c1;e.currentTarget.style.transform='translateY(-2px)'}} onMouseLeave={e=>{e.currentTarget.style.borderColor='var(--bd)';e.currentTarget.style.transform='none'}}><Logo ab={ab} sz={32}/><span style={{fontSize:9,color:'var(--dm)',fontWeight:600}}>{ab}</span></div>)}
+    <h2 style={{fontFamily:"'Bebas Neue'",fontSize:22,letterSpacing:1,marginBottom:12}}>ALL 32 TEAMS</h2>
+    <div style={{display:'grid',gridTemplateColumns:'repeat(8,1fr)',gap:10,marginBottom:24}}>
+      {ALL_AB.map(ab=><div key={ab} onClick={()=>goT(ab)} style={{display:'flex',flexDirection:'column',alignItems:'center',gap:5,padding:'12px 6px',borderRadius:14,border:'1px solid var(--bd)',background:'var(--s1)',cursor:'pointer',transition:'all .2s'}} onMouseEnter={e=>{e.currentTarget.style.borderColor=TM[ab].c1;e.currentTarget.style.transform='translateY(-2px)'}} onMouseLeave={e=>{e.currentTarget.style.borderColor='var(--bd)';e.currentTarget.style.transform='none'}}><Logo ab={ab} sz={36}/><span style={{fontSize:11,color:'var(--dm)',fontWeight:600}}>{ab}</span></div>)}
     </div>
     {loading && <Spinner msg="Fetching all 32 team rosters from ESPN..."/>}
   </div>
@@ -316,6 +363,7 @@ const Home = ({go,goT,players,loading}) => (
 // ═══════════════════════════════════════════════════════════════
 const Players = ({players,loading,sel,setSel,goT,statsCache,setStatsCache}) => {
   const[pos,setPos]=useState("ALL");const[q,setQ]=useState("");const[yr,setYr]=useState(null);const[fetching,setFetching]=useState(false);
+  const[gameLog,setGameLog]=useState([]);const[fetchingLog,setFetchingLog]=useState(false);
   const list = useMemo(()=>{let l=players;if(pos!=="ALL")l=l.filter(p=>p.pos===pos);if(q)l=l.filter(p=>p.nm.toLowerCase().includes(q.toLowerCase())||p.tm.toLowerCase().includes(q.toLowerCase()));return l},[players,pos,q]);
 
   const pl = players.find(p=>p.id===sel);
@@ -346,10 +394,24 @@ const Players = ({players,loading,sel,setSel,goT,statsCache,setStatsCache}) => {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   },[sel]);
 
+  // Fetch game log for matchup chart when player selected
+  useEffect(()=>{
+    if (!sel) { setGameLog([]); return; }
+    setFetchingLog(true);
+    fetchPlayerGameLog(sel, 2024).then(log => {
+      setGameLog(log || []);
+      setFetchingLog(false);
+    }).catch(()=>{
+      setGameLog([]);
+      setFetchingLog(false);
+    });
+  },[sel]);
+
   // Build chart data with ALL stat categories
   const chartData = seasons.map(([y,s])=>({
     year: y,
     "Fantasy Pts": s.fpts||0,
+    "Projected PPR": PROJ_PPR[pl?.pos]?.[y] || 0,
     "Pass Yds": s.passYd||0,
     "Pass TD": s.passTD||0,
     "Rush Yds": s.rushYd||0,
@@ -360,50 +422,64 @@ const Players = ({players,loading,sel,setSel,goT,statsCache,setStatsCache}) => {
     "INT": s.passInt||0,
   }));
 
-  return <div className="fu" style={{maxWidth:1320,margin:'0 auto',padding:'20px 16px'}}>
-    <div style={{display:'grid',gridTemplateColumns:'300px 1fr',gap:16,minHeight:'calc(100vh - 100px)'}}>
+  // Build matchup chart: avg PPR per opponent
+  const matchupData = useMemo(()=>{
+    if (!gameLog.length) return [];
+    const totals = {};
+    for (const g of gameLog) {
+      if (!totals[g.opp]) totals[g.opp] = { total: 0, count: 0 };
+      totals[g.opp].total += g.fpts;
+      totals[g.opp].count += 1;
+    }
+    return Object.entries(totals)
+      .map(([opp, d]) => ({ opp, avg: +(d.total / d.count).toFixed(1), games: d.count }))
+      .sort((a, b) => b.avg - a.avg);
+  }, [gameLog]);
+
+  return <div className="fu" style={{maxWidth:1400,margin:'0 auto',padding:'24px 20px'}}>
+    <div style={{display:'grid',gridTemplateColumns:'320px 1fr',gap:18,minHeight:'calc(100vh - 110px)'}}>
       {/* SIDEBAR */}
       <div>
-        <div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:12,padding:12,marginBottom:10}}>
-          <input value={q} onChange={e=>setQ(e.target.value)} placeholder="Search player or team..." style={{width:'100%',padding:'8px 10px',borderRadius:8,border:'1px solid var(--bd)',background:'rgba(0,0,0,.3)',color:'var(--tx)',outline:'none',fontSize:12,marginBottom:6}}/>
-          <div style={{display:'flex',gap:3}}>{["ALL","QB","RB","WR","TE"].map(p=><button key={p} onClick={()=>setPos(p)} style={{padding:'4px 10px',borderRadius:6,border:'none',background:pos===p?posColor(p==="ALL"?"QB":p):'rgba(255,255,255,.05)',color:pos===p?'#000':'var(--tx)',fontWeight:pos===p?800:500,fontSize:11,cursor:'pointer'}}>{p} {pos==="ALL"?"":p===pos?`(${list.length})`:""}</button>)}</div>
-          {!loading && <div style={{color:'var(--dm)',fontSize:10,marginTop:4}}>{list.length} players loaded from ESPN</div>}
+        <div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:14,padding:14,marginBottom:12}}>
+          <input value={q} onChange={e=>setQ(e.target.value)} placeholder="Search player or team..." style={{width:'100%',padding:'10px 12px',borderRadius:9,border:'1px solid var(--bd)',background:'rgba(0,0,0,.3)',color:'var(--tx)',outline:'none',fontSize:14,marginBottom:8}}/>
+          <div style={{display:'flex',gap:4}}>{["ALL","QB","RB","WR","TE"].map(p=><button key={p} onClick={()=>setPos(p)} style={{padding:'5px 12px',borderRadius:7,border:'none',background:pos===p?posColor(p==="ALL"?"QB":p):'rgba(255,255,255,.05)',color:pos===p?'#000':'var(--tx)',fontWeight:pos===p?800:500,fontSize:12,cursor:'pointer'}}>{p} {pos==="ALL"?"":p===pos?`(${list.length})`:""}</button>)}</div>
+          {!loading && <div style={{color:'var(--dm)',fontSize:11,marginTop:6}}>{list.length} players loaded from ESPN</div>}
         </div>
-        <div style={{maxHeight:'calc(100vh - 220px)',overflowY:'auto',display:'flex',flexDirection:'column',gap:3}}>
+        <div style={{maxHeight:'calc(100vh - 240px)',overflowY:'auto',display:'flex',flexDirection:'column',gap:4}}>
           {loading ? <Spinner msg="Loading rosters..."/> :
-            list.map(p=><div key={p.id} onClick={()=>setSel(p.id)} style={{display:'flex',alignItems:'center',gap:8,padding:'7px 10px',borderRadius:8,cursor:'pointer',background:sel===p.id?'rgba(249,115,22,.1)':'var(--s1)',border:`1px solid ${sel===p.id?'rgba(249,115,22,.25)':'var(--bd)'}`,transition:'all .12s'}}><Hs src={p.hs} sz={30}/><div style={{flex:1,minWidth:0}}><div style={{fontWeight:700,fontSize:12,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{p.nm}</div><div style={{display:'flex',alignItems:'center',gap:4}}><Pil ch={p.pos} c={posColor(p.pos)} s={{padding:'1px 5px',fontSize:9}}/><span style={{color:'var(--dm)',fontSize:10}}>{p.tm} #{p.n}</span></div></div></div>)}
+            list.map(p=><div key={p.id} onClick={()=>setSel(p.id)} style={{display:'flex',alignItems:'center',gap:9,padding:'9px 12px',borderRadius:10,cursor:'pointer',background:sel===p.id?'rgba(249,115,22,.1)':'var(--s1)',border:`1px solid ${sel===p.id?'rgba(249,115,22,.25)':'var(--bd)'}`,transition:'all .12s'}}><Hs src={p.hs} sz={34}/><div style={{flex:1,minWidth:0}}><div style={{fontWeight:700,fontSize:14,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{p.nm}</div><div style={{display:'flex',alignItems:'center',gap:5}}><Pil ch={p.pos} c={posColor(p.pos)} s={{padding:'2px 6px',fontSize:10}}/><span style={{color:'var(--dm)',fontSize:11}}>{p.tm} #{p.n}</span></div></div></div>)}
         </div>
       </div>
 
       {/* DETAIL */}
       <div>{!pl ?
-        <div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:12,padding:50,textAlign:'center'}}><h2 style={{fontFamily:"'Bebas Neue'"}}>SELECT A PLAYER</h2><p style={{color:'var(--dm)',fontSize:12,marginTop:4}}>Choose from {players.length} active NFL players</p></div>
+        <div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:14,padding:60,textAlign:'center'}}><h2 style={{fontFamily:"'Bebas Neue'",fontSize:22}}>SELECT A PLAYER</h2><p style={{color:'var(--dm)',fontSize:14,marginTop:6}}>Choose from {players.length} active NFL players</p></div>
       : fetching ?
         <Spinner msg={`Fetching stats for ${pl.nm} from ESPN API...`}/>
       :
         <div className="fu">
           {/* HEADER */}
-          <div style={{background:`linear-gradient(135deg,${TM[pl.tm]?.c1}20,var(--s1))`,border:'1px solid var(--bd)',borderRadius:12,padding:16,marginBottom:10}}>
-            <div style={{display:'flex',alignItems:'center',gap:14}}>
-              <Hs src={pl.hs} sz={72}/>
+          <div style={{background:`linear-gradient(135deg,${TM[pl.tm]?.c1}20,var(--s1))`,border:'1px solid var(--bd)',borderRadius:14,padding:18,marginBottom:12}}>
+            <div style={{display:'flex',alignItems:'center',gap:16}}>
+              <Hs src={pl.hs} sz={80}/>
               <div style={{flex:1}}>
-                <h2 style={{fontFamily:"'Bebas Neue'",fontSize:30,letterSpacing:2,lineHeight:1}}>{pl.nm}</h2>
-                <div style={{display:'flex',alignItems:'center',gap:6,marginTop:4}}>
+                <h2 style={{fontFamily:"'Bebas Neue'",fontSize:34,letterSpacing:2,lineHeight:1}}>{pl.nm}</h2>
+                <div style={{display:'flex',alignItems:'center',gap:8,marginTop:5}}>
                   <Pil ch={pl.pos} c={posColor(pl.pos)}/>
-                  <span style={{cursor:'pointer',color:'var(--dm)',fontSize:12,textDecoration:'underline'}} onClick={()=>goT(pl.tm)}>{TM[pl.tm]?.c} {TM[pl.tm]?.n}</span>
-                  <span style={{color:'var(--dm)',fontSize:12}}>#{pl.n}{pl.age?` • Age ${pl.age}`:""}{pl.exp?` • ${pl.exp}yr exp`:""}</span>
+                  <span style={{cursor:'pointer',color:'var(--dm)',fontSize:14,textDecoration:'underline'}} onClick={()=>goT(pl.tm)}>{TM[pl.tm]?.c} {TM[pl.tm]?.n}</span>
+                  <span style={{color:'var(--dm)',fontSize:14}}>#{pl.n}{pl.age?` • Age ${pl.age}`:""}{pl.exp?` • ${pl.exp}yr exp`:""}</span>
                 </div>
               </div>
-              <Logo ab={pl.tm} sz={44}/>
+              <Logo ab={pl.tm} sz={50}/>
             </div>
-            {seasons.length > 0 && <div style={{display:'flex',gap:3,marginTop:10,flexWrap:'wrap'}}>{seasons.map(([y])=><button key={y} onClick={()=>setYr(y)} style={{padding:'4px 9px',borderRadius:6,border:'none',background:ay===y?'var(--em)':'rgba(255,255,255,.05)',color:ay===y?'#000':'var(--tx)',fontWeight:ay===y?800:500,fontSize:11,cursor:'pointer'}}>{y}</button>)}</div>}
+            {seasons.length > 0 && <div style={{display:'flex',gap:4,marginTop:12,flexWrap:'wrap'}}>{seasons.map(([y])=><button key={y} onClick={()=>setYr(y)} style={{padding:'5px 11px',borderRadius:7,border:'none',background:ay===y?'var(--em)':'rgba(255,255,255,.05)',color:ay===y?'#000':'var(--tx)',fontWeight:ay===y?800:500,fontSize:13,cursor:'pointer'}}>{y}</button>)}</div>}
           </div>
 
           {!stats || seasons.length === 0 ?
-            <div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:12,padding:30,textAlign:'center',color:'var(--dm)'}}>No historical stats found. Player may be a rookie or data unavailable.</div>
+            <div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:14,padding:36,textAlign:'center',color:'var(--dm)'}}>No historical stats found. Player may be a rookie or data unavailable.</div>
           : <>
             {/* STAT CARDS */}
-            {st && <div style={{display:'flex',gap:6,flexWrap:'wrap',marginBottom:10}}>
+            {st && <div style={{display:'flex',gap:8,flexWrap:'wrap',marginBottom:12}}>
               <StCard l="GP" v={st.gp||"—"} c="var(--tx)"/>
               {(pl.pos==="QB") && <><StCard l="Pass Yds" v={st.passYd?.toLocaleString()} c="var(--em)"/><StCard l="Pass TD" v={st.passTD} c="var(--lm)"/><StCard l="INT" v={st.passInt} c="var(--rs)"/><StCard l="Rush Yds" v={st.rushYd?.toLocaleString()} c="var(--sk)"/><StCard l="Rush TD" v={st.rushTD} c="var(--vi)"/><StCard l="Rating" v={st.passRat?st.passRat.toFixed(1):"—"} c="var(--gd)"/></>}
               {(pl.pos==="RB") && <><StCard l="Rush Yds" v={st.rushYd?.toLocaleString()} c="var(--em)"/><StCard l="Rush TD" v={st.rushTD} c="var(--lm)"/><StCard l="Rec" v={st.rec} c="var(--sk)"/><StCard l="Rec Yds" v={st.recYd?.toLocaleString()} c="var(--vi)"/><StCard l="Rec TD" v={st.recTD} c="var(--gd)"/></>}
@@ -412,17 +488,17 @@ const Players = ({players,loading,sel,setSel,goT,statsCache,setStatsCache}) => {
             </div>}
 
             {/* CHARTS — All stat categories */}
-            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:10}}>
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:12,marginBottom:12}}>
               {/* Fantasy Points */}
-              <div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:12,padding:12}}>
-                <div style={{fontFamily:"'Bebas Neue'",fontSize:14,letterSpacing:1,marginBottom:8}}>FANTASY POINTS (PPR)</div>
-                <ResponsiveContainer width="100%" height={180}><AreaChart data={chartData}><defs><linearGradient id="fg" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#F97316" stopOpacity={.3}/><stop offset="95%" stopColor="#F97316" stopOpacity={0}/></linearGradient></defs><CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,.04)"/><XAxis dataKey="year"/><YAxis/><Tooltip content={<TT/>}/><Area type="monotone" dataKey="Fantasy Pts" stroke="#F97316" fill="url(#fg)" strokeWidth={2}/></AreaChart></ResponsiveContainer>
+              <div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:14,padding:14}}>
+                <div style={{fontFamily:"'Bebas Neue'",fontSize:16,letterSpacing:1,marginBottom:10}}>FANTASY POINTS (PPR)</div>
+                <ResponsiveContainer width="100%" height={200}><AreaChart data={chartData}><defs><linearGradient id="fg" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#F97316" stopOpacity={.3}/><stop offset="95%" stopColor="#F97316" stopOpacity={0}/></linearGradient></defs><CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,.04)"/><XAxis dataKey="year"/><YAxis/><Tooltip content={<TT/>}/><Area type="monotone" dataKey="Fantasy Pts" stroke="#F97316" fill="url(#fg)" strokeWidth={2}/></AreaChart></ResponsiveContainer>
               </div>
 
               {/* Yards (Pass + Rush + Rec) */}
-              <div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:12,padding:12}}>
-                <div style={{fontFamily:"'Bebas Neue'",fontSize:14,letterSpacing:1,marginBottom:8}}>YARDS BY SEASON</div>
-                <ResponsiveContainer width="100%" height={180}><BarChart data={chartData}><CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,.04)"/><XAxis dataKey="year"/><YAxis/><Tooltip content={<TT/>}/><Legend iconSize={8}/>
+              <div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:14,padding:14}}>
+                <div style={{fontFamily:"'Bebas Neue'",fontSize:16,letterSpacing:1,marginBottom:10}}>YARDS BY SEASON</div>
+                <ResponsiveContainer width="100%" height={200}><BarChart data={chartData}><CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,.04)"/><XAxis dataKey="year"/><YAxis/><Tooltip content={<TT/>}/><Legend iconSize={10}/>
                   {pl.pos==="QB" && <Bar dataKey="Pass Yds" fill="#F97316" radius={[3,3,0,0]}/>}
                   <Bar dataKey="Rush Yds" fill="#22C55E" radius={[3,3,0,0]}/>
                   <Bar dataKey="Rec Yds" fill="#38BDF8" radius={[3,3,0,0]}/>
@@ -430,21 +506,21 @@ const Players = ({players,loading,sel,setSel,goT,statsCache,setStatsCache}) => {
               </div>
 
               {/* Touchdowns (All types) */}
-              <div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:12,padding:12}}>
-                <div style={{fontFamily:"'Bebas Neue'",fontSize:14,letterSpacing:1,marginBottom:8}}>TOUCHDOWNS BY SEASON</div>
-                <ResponsiveContainer width="100%" height={180}><LineChart data={chartData}><CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,.04)"/><XAxis dataKey="year"/><YAxis/><Tooltip content={<TT/>}/><Legend iconSize={8}/>
-                  {pl.pos==="QB" && <Line type="monotone" dataKey="Pass TD" stroke="#F97316" strokeWidth={2} dot={{fill:'#F97316',r:3}}/>}
-                  <Line type="monotone" dataKey="Rush TD" stroke="#22C55E" strokeWidth={2} dot={{fill:'#22C55E',r:3}}/>
-                  <Line type="monotone" dataKey="Rec TD" stroke="#38BDF8" strokeWidth={2} dot={{fill:'#38BDF8',r:3}}/>
+              <div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:14,padding:14}}>
+                <div style={{fontFamily:"'Bebas Neue'",fontSize:16,letterSpacing:1,marginBottom:10}}>TOUCHDOWNS BY SEASON</div>
+                <ResponsiveContainer width="100%" height={200}><LineChart data={chartData}><CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,.04)"/><XAxis dataKey="year"/><YAxis/><Tooltip content={<TT/>}/><Legend iconSize={10}/>
+                  {pl.pos==="QB" && <Line type="monotone" dataKey="Pass TD" stroke="#F97316" strokeWidth={2} dot={{fill:'#F97316',r:4}}/>}
+                  <Line type="monotone" dataKey="Rush TD" stroke="#22C55E" strokeWidth={2} dot={{fill:'#22C55E',r:4}}/>
+                  <Line type="monotone" dataKey="Rec TD" stroke="#38BDF8" strokeWidth={2} dot={{fill:'#38BDF8',r:4}}/>
                 </LineChart></ResponsiveContainer>
               </div>
 
               {/* Receiving or Passing specific */}
-              <div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:12,padding:12}}>
-                <div style={{fontFamily:"'Bebas Neue'",fontSize:14,letterSpacing:1,marginBottom:8}}>
+              <div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:14,padding:14}}>
+                <div style={{fontFamily:"'Bebas Neue'",fontSize:16,letterSpacing:1,marginBottom:10}}>
                   {pl.pos==="QB" ? "INTERCEPTIONS" : "RECEPTIONS"}
                 </div>
-                <ResponsiveContainer width="100%" height={180}><BarChart data={chartData}><CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,.04)"/><XAxis dataKey="year"/><YAxis/><Tooltip content={<TT/>}/>
+                <ResponsiveContainer width="100%" height={200}><BarChart data={chartData}><CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,.04)"/><XAxis dataKey="year"/><YAxis/><Tooltip content={<TT/>}/>
                   {pl.pos==="QB" ?
                     <Bar dataKey="INT" fill="#F43F5E" radius={[3,3,0,0]}/> :
                     <Bar dataKey="Receptions" fill="#A78BFA" radius={[3,3,0,0]}/>}
@@ -452,10 +528,51 @@ const Players = ({players,loading,sel,setSel,goT,statsCache,setStatsCache}) => {
               </div>
             </div>
 
+            {/* PROJECTED vs ACTUAL PPR CHART */}
+            <div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:14,padding:14,marginBottom:12}}>
+              <div style={{fontFamily:"'Bebas Neue'",fontSize:16,letterSpacing:1,marginBottom:4}}>PROJECTED vs ACTUAL PPR BY SEASON</div>
+              <div style={{color:'var(--dm)',fontSize:12,marginBottom:10}}>Actual PPR scored (orange) vs position-average projection (dashed blue) — shows over/underperformance each year</div>
+              <ResponsiveContainer width="100%" height={220}>
+                <LineChart data={chartData}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,.04)"/>
+                  <XAxis dataKey="year" tick={{fontSize:13}}/>
+                  <YAxis tick={{fontSize:13}}/>
+                  <Tooltip content={<TT/>}/>
+                  <Legend iconSize={10}/>
+                  <Line type="monotone" dataKey="Fantasy Pts" stroke="#F97316" strokeWidth={2.5} dot={{fill:'#F97316',r:4}} name="Actual PPR"/>
+                  <Line type="monotone" dataKey="Projected PPR" stroke="#38BDF8" strokeWidth={2} strokeDasharray="6 3" dot={{fill:'#38BDF8',r:3}} name="Proj PPR (pos avg)"/>
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+
+            {/* MATCHUP CHART — avg PPR vs each opponent (2024 game log) */}
+            <div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:14,padding:14,marginBottom:12}}>
+              <div style={{fontFamily:"'Bebas Neue'",fontSize:16,letterSpacing:1,marginBottom:4}}>AVG PPR POINTS VS OPPONENT (2024)</div>
+              <div style={{color:'var(--dm)',fontSize:12,marginBottom:10}}>Average fantasy points scored against each team faced in the 2024 season — sorted highest to lowest</div>
+              {fetchingLog ? <Spinner msg="Loading game log..."/> :
+               matchupData.length === 0 ?
+                <div style={{color:'var(--dm)',fontSize:13,padding:'20px 0',textAlign:'center'}}>Game log data not available for this player.</div>
+              :
+                <ResponsiveContainer width="100%" height={Math.max(200, matchupData.length * 28)}>
+                  <BarChart data={matchupData} layout="vertical" margin={{left:10,right:20}}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,.04)"/>
+                    <XAxis type="number" tick={{fontSize:12}}/>
+                    <YAxis dataKey="opp" type="category" width={44} tick={{fontSize:12}}/>
+                    <Tooltip content={<TT/>}/>
+                    <Bar dataKey="avg" name="Avg PPR" radius={[0,4,4,0]}>
+                      {matchupData.map((entry, idx) => (
+                        <Cell key={idx} fill={entry.avg >= 20 ? "#22C55E" : entry.avg >= 10 ? "#F97316" : "#F43F5E"}/>
+                      ))}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              }
+            </div>
+
             {/* STAT TABLE */}
-            <div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:12,padding:12,overflowX:'auto'}}>
-              <div style={{fontFamily:"'Bebas Neue'",fontSize:14,letterSpacing:1,marginBottom:8}}>CAREER STATS (2017-2025)</div>
-              <table style={{width:'100%',borderCollapse:'collapse',fontSize:11}}><thead><tr style={{borderBottom:'2px solid var(--bd)'}}>
+            <div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:14,padding:14,overflowX:'auto'}}>
+              <div style={{fontFamily:"'Bebas Neue'",fontSize:16,letterSpacing:1,marginBottom:10}}>CAREER STATS (2017-2025)</div>
+              <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}><thead><tr style={{borderBottom:'2px solid var(--bd)'}}>
                 <th style={th}>Year</th><th style={th}>GP</th>
                 <th style={th}>Pass Yd</th><th style={th}>P-TD</th><th style={th}>INT</th>
                 <th style={th}>Rush Yd</th><th style={th}>R-TD</th>
@@ -493,22 +610,39 @@ const Teams = ({sel,setSel,players,goP}) => {
   const afcT = new Set(ALL_AB.filter(ab=>TM[ab].conf==="AFC"));
   const filt = conf==="ALL"?ALL_AB:ALL_AB.filter(ab=>conf==="AFC"?afcT.has(ab):!afcT.has(ab));
 
-  return <div className="fu" style={{maxWidth:1320,margin:'0 auto',padding:'20px 16px'}}><div style={{display:'grid',gridTemplateColumns:'260px 1fr',gap:16}}>
+  return <div className="fu" style={{maxWidth:1400,margin:'0 auto',padding:'24px 20px'}}><div style={{display:'grid',gridTemplateColumns:'280px 1fr',gap:18}}>
     <div>
-      <div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:12,padding:10,marginBottom:8}}><div style={{display:'flex',gap:3}}>{["ALL","AFC","NFC"].map(c=><button key={c} onClick={()=>setConf(c)} style={{flex:1,padding:'4px',borderRadius:6,border:'none',background:conf===c?'var(--em)':'rgba(255,255,255,.05)',color:conf===c?'#000':'var(--tx)',fontWeight:conf===c?800:500,fontSize:11,cursor:'pointer'}}>{c}</button>)}</div></div>
-      <div style={{maxHeight:'calc(100vh - 180px)',overflowY:'auto',display:'flex',flexDirection:'column',gap:3}}>
-        {filt.map(ab=>{const cnt=players.filter(p=>p.tm===ab).length;return<div key={ab} onClick={()=>setSel(ab)} style={{display:'flex',alignItems:'center',gap:8,padding:'6px 10px',borderRadius:8,cursor:'pointer',background:sel===ab?`${TM[ab].c1}18`:'var(--s1)',border:`1px solid ${sel===ab?TM[ab].c1+'44':'var(--bd)'}`}}><Logo ab={ab} sz={28}/><div style={{flex:1}}><div style={{fontWeight:700,fontSize:11}}>{TM[ab].c} {TM[ab].n}</div><div style={{color:'var(--dm)',fontSize:9}}>{cnt} offensive players</div></div></div>})}
+      <div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:14,padding:12,marginBottom:10}}><div style={{display:'flex',gap:4}}>{["ALL","AFC","NFC"].map(c=><button key={c} onClick={()=>setConf(c)} style={{flex:1,padding:'6px',borderRadius:7,border:'none',background:conf===c?'var(--em)':'rgba(255,255,255,.05)',color:conf===c?'#000':'var(--tx)',fontWeight:conf===c?800:500,fontSize:13,cursor:'pointer'}}>{c}</button>)}</div></div>
+      <div style={{maxHeight:'calc(100vh - 200px)',overflowY:'auto',display:'flex',flexDirection:'column',gap:4}}>
+        {filt.map(ab=>{const cnt=players.filter(p=>p.tm===ab).length;return<div key={ab} onClick={()=>setSel(ab)} style={{display:'flex',alignItems:'center',gap:9,padding:'8px 12px',borderRadius:10,cursor:'pointer',background:sel===ab?`${TM[ab].c1}18`:'var(--s1)',border:`1px solid ${sel===ab?TM[ab].c1+'44':'var(--bd)'}`}}><Logo ab={ab} sz={32}/><div style={{flex:1}}><div style={{fontWeight:700,fontSize:13}}>{TM[ab].c} {TM[ab].n}</div><div style={{color:'var(--dm)',fontSize:11}}>{cnt} offensive players</div></div></div>})}
       </div>
     </div>
-    <div>{!t?<div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:12,padding:50,textAlign:'center'}}><h2 style={{fontFamily:"'Bebas Neue'"}}>SELECT A TEAM</h2></div>:
+    <div>{!t?<div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:14,padding:60,textAlign:'center'}}><h2 style={{fontFamily:"'Bebas Neue'",fontSize:22}}>SELECT A TEAM</h2></div>:
       <div className="fu">
-        <div style={{background:`linear-gradient(135deg,${t.c1}20,var(--s1))`,border:'1px solid var(--bd)',borderRadius:12,padding:16,marginBottom:10,display:'flex',alignItems:'center',gap:14}}><Logo ab={sel} sz={56}/><div><h2 style={{fontFamily:"'Bebas Neue'",fontSize:28,letterSpacing:2}}>{t.c} {t.n}</h2><div style={{color:'var(--dm)',fontSize:12}}>{t.conf} {t.div} • {roster.length} offensive players</div></div></div>
-        {["QB","RB","WR","TE"].map(pos=>{const group=roster.filter(p=>p.pos===pos);if(!group.length)return null;return<div key={pos} style={{marginBottom:12}}>
-          <div style={{fontFamily:"'Bebas Neue'",fontSize:14,letterSpacing:1,marginBottom:6,color:posColor(pos)}}>{pos}s ({group.length})</div>
-          <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(200px,1fr))',gap:6}}>
-            {group.map(p=><div key={p.id} onClick={()=>goP(p.id)} style={{display:'flex',alignItems:'center',gap:8,padding:'8px 10px',borderRadius:8,cursor:'pointer',background:'rgba(0,0,0,.2)',border:'1px solid var(--bd)',transition:'all .12s'}} onMouseEnter={e=>e.currentTarget.style.borderColor=t.c1} onMouseLeave={e=>e.currentTarget.style.borderColor='var(--bd)'}><Hs src={p.hs} sz={32}/><div><div style={{fontWeight:700,fontSize:12}}>{p.nm}</div><div style={{color:'var(--dm)',fontSize:10}}>#{p.n}{p.age?` • ${p.age}yr`:""}</div></div></div>)}
-          </div>
-        </div>})}
+        <div style={{background:`linear-gradient(135deg,${t.c1}20,var(--s1))`,border:'1px solid var(--bd)',borderRadius:14,padding:18,marginBottom:12,display:'flex',alignItems:'center',gap:16}}><Logo ab={sel} sz={64}/><div><h2 style={{fontFamily:"'Bebas Neue'",fontSize:32,letterSpacing:2}}>{t.c} {t.n}</h2><div style={{color:'var(--dm)',fontSize:14}}>{t.conf} {t.div} • {roster.length} offensive players</div></div></div>
+        {["QB","RB","WR","TE"].map(pos=>{
+          const group = roster.filter(p=>p.pos===pos);
+          if (!group.length) return null;
+          // Sort by jersey number ascending as a proxy for depth order
+          const sorted = [...group].sort((a,b)=>(+a.n||99)-(+b.n||99));
+          return <div key={pos} style={{marginBottom:14}}>
+            <div style={{fontFamily:"'Bebas Neue'",fontSize:16,letterSpacing:1,marginBottom:8,color:posColor(pos)}}>{pos}s ({group.length})</div>
+            <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(220px,1fr))',gap:8}}>
+              {sorted.map((p,idx)=>{
+                const depthLbl = (DEPTH_LABEL[pos]||[])[idx] || `${pos}${idx+1}`;
+                return <div key={p.id} onClick={()=>goP(p.id)} style={{display:'flex',alignItems:'center',gap:10,padding:'10px 12px',borderRadius:10,cursor:'pointer',background:'rgba(0,0,0,.2)',border:'1px solid var(--bd)',transition:'all .12s',position:'relative'}} onMouseEnter={e=>e.currentTarget.style.borderColor=t.c1} onMouseLeave={e=>e.currentTarget.style.borderColor='var(--bd)'}>
+                  {/* Depth label badge */}
+                  <div style={{position:'absolute',top:6,right:8,background:`${posColor(pos)}22`,border:`1px solid ${posColor(pos)}44`,color:posColor(pos),fontSize:10,fontWeight:800,fontFamily:"'Bebas Neue'",letterSpacing:.5,padding:'1px 6px',borderRadius:5}}>{depthLbl}</div>
+                  <Hs src={p.hs} sz={38}/>
+                  <div>
+                    <div style={{fontWeight:700,fontSize:14}}>{p.nm}</div>
+                    <div style={{color:'var(--dm)',fontSize:12}}>#{p.n}{p.age?` • ${p.age}yr`:""}{p.exp!=null?` • ${p.exp}yr exp`:""}</div>
+                  </div>
+                </div>;
+              })}
+            </div>
+          </div>;
+        })}
       </div>}
     </div>
   </div></div>;
@@ -527,37 +661,71 @@ const GamesFetch = ({goT}) => {
   },[szn,wk,sType]);
   useEffect(()=>{fetchG()},[fetchG]);
   const maxWk=sType===2?(szn>=2021?18:17):(sType===3?5:1);
-  return <div className="fu" style={{maxWidth:1320,margin:'0 auto',padding:'20px 16px'}}>
-    <div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:12,padding:14,marginBottom:14}}>
-      <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',flexWrap:'wrap',gap:8}}>
-        <h2 style={{fontFamily:"'Bebas Neue'",fontSize:22,letterSpacing:1}}>GAME DATABASE <Pil ch="LIVE ESPN API" c="var(--lm)" s={{marginLeft:8,fontSize:9}}/></h2>
-        <div style={{display:'flex',gap:3,flexWrap:'wrap'}}>{[2017,2018,2019,2020,2021,2022,2023,2024,2025].map(s=><button key={s} onClick={()=>{setSzn(s);setWk(1)}} style={{padding:'4px 10px',borderRadius:6,border:'none',background:szn===s?'var(--em)':'rgba(255,255,255,.05)',color:szn===s?'#000':'var(--tx)',fontWeight:szn===s?800:500,fontSize:11,cursor:'pointer'}}>{s}</button>)}</div>
+
+  // Weather icon helper
+  const wxIcon = (cond) => {
+    if (!cond) return "";
+    const c = cond.toLowerCase();
+    if (c.includes("snow")) return "❄️";
+    if (c.includes("rain") || c.includes("drizzle")) return "🌧️";
+    if (c.includes("thunder") || c.includes("storm")) return "⛈️";
+    if (c.includes("cloud") || c.includes("overcast")) return "☁️";
+    if (c.includes("clear") || c.includes("sunny")) return "☀️";
+    if (c.includes("fog") || c.includes("mist")) return "🌫️";
+    if (c.includes("wind")) return "💨";
+    return "🌤️";
+  };
+
+  return <div className="fu" style={{maxWidth:1400,margin:'0 auto',padding:'24px 20px'}}>
+    <div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:14,padding:16,marginBottom:16}}>
+      <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',flexWrap:'wrap',gap:10}}>
+        <h2 style={{fontFamily:"'Bebas Neue'",fontSize:24,letterSpacing:1}}>GAME DATABASE <Pil ch="LIVE ESPN API" c="var(--lm)" s={{marginLeft:10,fontSize:11}}/></h2>
+        <div style={{display:'flex',gap:4,flexWrap:'wrap'}}>{[2017,2018,2019,2020,2021,2022,2023,2024,2025].map(s=><button key={s} onClick={()=>{setSzn(s);setWk(1)}} style={{padding:'5px 12px',borderRadius:7,border:'none',background:szn===s?'var(--em)':'rgba(255,255,255,.05)',color:szn===s?'#000':'var(--tx)',fontWeight:szn===s?800:500,fontSize:13,cursor:'pointer'}}>{s}</button>)}</div>
       </div>
-      <div style={{display:'flex',gap:4,marginTop:8,flexWrap:'wrap',alignItems:'center'}}>
-        <div style={{display:'flex',gap:3,marginRight:8}}>{[{l:"Regular",v:2},{l:"Playoffs",v:3}].map(t=><button key={t.v} onClick={()=>{setSType(t.v);setWk(1)}} style={{padding:'4px 10px',borderRadius:6,border:'none',background:sType===t.v?'var(--sk)':'rgba(255,255,255,.04)',color:sType===t.v?'#000':'var(--dm)',fontWeight:sType===t.v?700:400,fontSize:11,cursor:'pointer'}}>{t.l}</button>)}</div>
-        {Array.from({length:maxWk},(_,i)=>i+1).map(w=><button key={w} onClick={()=>setWk(w)} style={{padding:'3px 8px',borderRadius:5,border:'none',background:wk===w?'var(--em)':'rgba(255,255,255,.03)',color:wk===w?'#000':'var(--dm)',fontWeight:wk===w?800:400,fontSize:10,cursor:'pointer',minWidth:28}}>W{w}</button>)}
+      <div style={{display:'flex',gap:5,marginTop:10,flexWrap:'wrap',alignItems:'center'}}>
+        <div style={{display:'flex',gap:4,marginRight:10}}>{[{l:"Regular",v:2},{l:"Playoffs",v:3}].map(t=><button key={t.v} onClick={()=>{setSType(t.v);setWk(1)}} style={{padding:'5px 12px',borderRadius:7,border:'none',background:sType===t.v?'var(--sk)':'rgba(255,255,255,.04)',color:sType===t.v?'#000':'var(--dm)',fontWeight:sType===t.v?700:400,fontSize:13,cursor:'pointer'}}>{t.l}</button>)}</div>
+        {Array.from({length:maxWk},(_,i)=>i+1).map(w=><button key={w} onClick={()=>setWk(w)} style={{padding:'4px 9px',borderRadius:6,border:'none',background:wk===w?'var(--em)':'rgba(255,255,255,.03)',color:wk===w?'#000':'var(--dm)',fontWeight:wk===w?800:400,fontSize:12,cursor:'pointer',minWidth:32}}>W{w}</button>)}
       </div>
     </div>
     {loading&&<Spinner msg="Loading from ESPN..."/>}
-    <div style={{display:'flex',flexDirection:'column',gap:8}}>
+    <div style={{display:'flex',flexDirection:'column',gap:10}}>
       {games.map(g=>{
         const c=g.competitions?.[0];if(!c)return null;
         const home=c.competitors?.find(x=>x.homeAway==="home");const away=c.competitors?.find(x=>x.homeAway==="away");
         if(!home||!away)return null;
         const hAb=home.team?.abbreviation;const aAb=away.team?.abbreviation;const hS=+home.score;const aS=+away.score;
-        return<div key={g.id} style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:12,padding:14}}>
-          <div style={{display:'flex',justifyContent:'space-between',marginBottom:8,flexWrap:'wrap',gap:4}}>
-            <Pil ch={g.shortName||g.name||`Week ${wk}`} c="var(--sk)"/><span style={{color:'var(--dm)',fontSize:11}}>{g.date?new Date(g.date).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}):''}</span>
+
+        // Weather data from ESPN API
+        const wx = c.weather || null;
+        const wxTemp = wx?.temperature != null ? `${Math.round(wx.temperature)}°F` : null;
+        const wxCond = wx?.displayValue || wx?.condition || null;
+        const wxWind = wx?.windSpeed != null ? `${Math.round(wx.windSpeed)} mph` : null;
+        const wxGust = wx?.windGust != null ? `${Math.round(wx.windGust)} mph gusts` : null;
+        const wxHumid = wx?.humidity != null ? `${wx.humidity}% humidity` : null;
+
+        return<div key={g.id} style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:14,padding:16}}>
+          <div style={{display:'flex',justifyContent:'space-between',marginBottom:10,flexWrap:'wrap',gap:5}}>
+            <Pil ch={g.shortName||g.name||`Week ${wk}`} c="var(--sk)"/><span style={{color:'var(--dm)',fontSize:13}}>{g.date?new Date(g.date).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}):''}</span>
           </div>
-          <div style={{display:'flex',alignItems:'center',gap:14}}>
-            <div style={{display:'flex',alignItems:'center',gap:6,flex:1}}><Logo ab={aAb} sz={32} onClick={()=>goT(aAb)}/><span style={{fontWeight:700,fontSize:12}}>{away.team?.displayName||aAb}</span><span style={{fontFamily:"'Bebas Neue'",fontSize:28,letterSpacing:1,marginLeft:'auto',color:aS>hS?'var(--lm)':'var(--tx)'}}>{aS}</span></div>
-            <span style={{color:'var(--dm)',fontSize:11}}>@</span>
-            <div style={{display:'flex',alignItems:'center',gap:6,flex:1}}><span style={{fontFamily:"'Bebas Neue'",fontSize:28,letterSpacing:1,color:hS>aS?'var(--lm)':'var(--tx)'}}>{hS}</span><span style={{fontWeight:700,fontSize:12,marginRight:'auto'}}>{home.team?.displayName||hAb}</span><Logo ab={hAb} sz={32} onClick={()=>goT(hAb)}/></div>
+          <div style={{display:'flex',alignItems:'center',gap:16}}>
+            <div style={{display:'flex',alignItems:'center',gap:8,flex:1}}><Logo ab={aAb} sz={36} onClick={()=>goT(aAb)}/><span style={{fontWeight:700,fontSize:14}}>{away.team?.displayName||aAb}</span><span style={{fontFamily:"'Bebas Neue'",fontSize:32,letterSpacing:1,marginLeft:'auto',color:aS>hS?'var(--lm)':'var(--tx)'}}>{aS}</span></div>
+            <span style={{color:'var(--dm)',fontSize:13}}>@</span>
+            <div style={{display:'flex',alignItems:'center',gap:8,flex:1}}><span style={{fontFamily:"'Bebas Neue'",fontSize:32,letterSpacing:1,color:hS>aS?'var(--lm)':'var(--tx)'}}>{hS}</span><span style={{fontWeight:700,fontSize:14,marginRight:'auto'}}>{home.team?.displayName||hAb}</span><Logo ab={hAb} sz={36} onClick={()=>goT(hAb)}/></div>
           </div>
-          {c.venue&&<div style={{color:'var(--dm)',fontSize:10,marginTop:6}}>{c.venue.fullName}</div>}
-        </div>
+          {/* Venue + Weather row */}
+          <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',flexWrap:'wrap',gap:8,marginTop:8}}>
+            {c.venue && <div style={{color:'var(--dm)',fontSize:12}}>📍 {c.venue.fullName}{c.venue.indoor?' • Indoor':''}</div>}
+            {wx && <div style={{display:'flex',alignItems:'center',gap:10,flexWrap:'wrap'}}>
+              {wxCond && <span style={{color:'var(--sk)',fontSize:12,fontWeight:600}}>{wxIcon(wxCond)} {wxCond}</span>}
+              {wxTemp && <span style={{color:'var(--tx)',fontSize:12}}>{wxTemp}</span>}
+              {wxWind && <span style={{color:'var(--dm)',fontSize:12}}>💨 {wxWind}{wxGust?` (${wxGust})`:''}</span>}
+              {wxHumid && <span style={{color:'var(--dm)',fontSize:12}}>{wxHumid}</span>}
+            </div>}
+            {!wx && c.venue && !c.venue.indoor && <span style={{color:'var(--dm)',fontSize:11,fontStyle:'italic'}}>Weather unavailable</span>}
+          </div>
+        </div>;
       })}
-      {!loading&&games.length===0&&<div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:12,padding:30,textAlign:'center',color:'var(--dm)'}}>No games found for this selection.</div>}
+      {!loading&&games.length===0&&<div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:14,padding:36,textAlign:'center',color:'var(--dm)'}}>No games found for this selection.</div>}
     </div>
   </div>;
 };
@@ -566,36 +734,36 @@ const GamesFetch = ({goT}) => {
 //  BRACKETS
 // ═══════════════════════════════════════════════════════════════
 const BG = ({a,h,as,hs,goT}) => (
-  <div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:8,padding:'6px 8px',minWidth:155,fontSize:11}}>
-    <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:6}}><div style={{display:'flex',alignItems:'center',gap:4,cursor:'pointer'}} onClick={()=>goT(a)}><Logo ab={a} sz={18}/><span style={{fontWeight:as>hs?800:400}}>{a}</span></div><span style={{fontFamily:"'Bebas Neue'",fontSize:16,color:as>hs?'var(--lm)':'var(--dm)'}}>{as}</span></div>
-    <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:6,marginTop:3}}><div style={{display:'flex',alignItems:'center',gap:4,cursor:'pointer'}} onClick={()=>goT(h)}><Logo ab={h} sz={18}/><span style={{fontWeight:hs>as?800:400}}>{h}</span></div><span style={{fontFamily:"'Bebas Neue'",fontSize:16,color:hs>as?'var(--lm)':'var(--dm)'}}>{hs}</span></div>
+  <div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:10,padding:'8px 10px',minWidth:170,fontSize:13}}>
+    <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:7}}><div style={{display:'flex',alignItems:'center',gap:5,cursor:'pointer'}} onClick={()=>goT(a)}><Logo ab={a} sz={20}/><span style={{fontWeight:as>hs?800:400}}>{a}</span></div><span style={{fontFamily:"'Bebas Neue'",fontSize:18,color:as>hs?'var(--lm)':'var(--dm)'}}>{as}</span></div>
+    <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:7,marginTop:4}}><div style={{display:'flex',alignItems:'center',gap:5,cursor:'pointer'}} onClick={()=>goT(h)}><Logo ab={h} sz={20}/><span style={{fontWeight:hs>as?800:400}}>{h}</span></div><span style={{fontFamily:"'Bebas Neue'",fontSize:18,color:hs>as?'var(--lm)':'var(--dm)'}}>{hs}</span></div>
   </div>
 );
 
 const Brackets = ({goT}) => {
   const[yr,setYr]=useState(2024);const b=BK[yr];if(!b)return null;
   const rn = r=>r==="WC"?"Wild Card":r==="DIV"?"Divisional":"Championship";
-  return <div className="fu" style={{maxWidth:1320,margin:'0 auto',padding:'20px 16px'}}>
-    <div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:12,padding:14,marginBottom:14}}>
-      <h2 style={{fontFamily:"'Bebas Neue'",fontSize:22,letterSpacing:1,marginBottom:8}}>PLAYOFF BRACKETS</h2>
-      <div style={{display:'flex',gap:3,flexWrap:'wrap'}}>{Object.keys(BK).sort((a,b)=>+b-+a).map(y=><button key={y} onClick={()=>setYr(+y)} style={{padding:'5px 12px',borderRadius:6,border:'none',background:yr===+y?'var(--em)':'rgba(255,255,255,.05)',color:yr===+y?'#000':'var(--tx)',fontWeight:yr===+y?800:500,fontSize:12,cursor:'pointer'}}>{y}</button>)}</div>
+  return <div className="fu" style={{maxWidth:1400,margin:'0 auto',padding:'24px 20px'}}>
+    <div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:14,padding:16,marginBottom:16}}>
+      <h2 style={{fontFamily:"'Bebas Neue'",fontSize:24,letterSpacing:1,marginBottom:10}}>PLAYOFF BRACKETS</h2>
+      <div style={{display:'flex',gap:4,flexWrap:'wrap'}}>{Object.keys(BK).sort((a,b)=>+b-+a).map(y=><button key={y} onClick={()=>setYr(+y)} style={{padding:'6px 14px',borderRadius:7,border:'none',background:yr===+y?'var(--em)':'rgba(255,255,255,.05)',color:yr===+y?'#000':'var(--tx)',fontWeight:yr===+y?800:500,fontSize:14,cursor:'pointer'}}>{y}</button>)}</div>
     </div>
-    <div style={{background:'var(--s1)',border:'1px solid rgba(245,158,11,.2)',borderRadius:14,padding:16,marginBottom:14,textAlign:'center'}}>
-      <Pil ch={`SUPER BOWL • ${yr} SEASON`} c="var(--gd)" s={{marginBottom:10,display:'inline-flex'}}/>
-      <div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:16,marginBottom:6}}>
-        <div style={{display:'flex',alignItems:'center',gap:8,cursor:'pointer'}} onClick={()=>goT(b.sb.a)}><Logo ab={b.sb.a} sz={40}/><span style={{fontFamily:"'Bebas Neue'",fontSize:36,color:b.sb.as>b.sb.hs?'var(--lm)':'var(--tx)'}}>{b.sb.as}</span></div>
-        <span style={{color:'var(--dm)'}}>vs</span>
-        <div style={{display:'flex',alignItems:'center',gap:8,cursor:'pointer'}} onClick={()=>goT(b.sb.h)}><span style={{fontFamily:"'Bebas Neue'",fontSize:36,color:b.sb.hs>b.sb.as?'var(--lm)':'var(--tx)'}}>{b.sb.hs}</span><Logo ab={b.sb.h} sz={40}/></div>
+    <div style={{background:'var(--s1)',border:'1px solid rgba(245,158,11,.2)',borderRadius:16,padding:18,marginBottom:16,textAlign:'center'}}>
+      <Pil ch={`SUPER BOWL • ${yr} SEASON`} c="var(--gd)" s={{marginBottom:12,display:'inline-flex'}}/>
+      <div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:18,marginBottom:8}}>
+        <div style={{display:'flex',alignItems:'center',gap:10,cursor:'pointer'}} onClick={()=>goT(b.sb.a)}><Logo ab={b.sb.a} sz={46}/><span style={{fontFamily:"'Bebas Neue'",fontSize:42,color:b.sb.as>b.sb.hs?'var(--lm)':'var(--tx)'}}>{b.sb.as}</span></div>
+        <span style={{color:'var(--dm)',fontSize:15}}>vs</span>
+        <div style={{display:'flex',alignItems:'center',gap:10,cursor:'pointer'}} onClick={()=>goT(b.sb.h)}><span style={{fontFamily:"'Bebas Neue'",fontSize:42,color:b.sb.hs>b.sb.as?'var(--lm)':'var(--tx)'}}>{b.sb.hs}</span><Logo ab={b.sb.h} sz={46}/></div>
       </div>
       {b.sb.mvp&&<Pil ch={`MVP: ${b.sb.mvp}`} c="var(--lm)"/>}
     </div>
-    <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:14}}>
+    <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:16}}>
       {[{l:"AFC",d:b.afc,c:"var(--rs)"},{l:"NFC",d:b.nfc,c:"var(--sk)"}].map(conf=>(
-        <div key={conf.l} style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:12,padding:14}}>
-          <div style={{fontFamily:"'Bebas Neue'",fontSize:18,letterSpacing:1,marginBottom:10,color:conf.c}}>{conf.l} BRACKET</div>
-          {conf.d?.map((rd,ri)=><div key={ri} style={{marginBottom:12}}>
-            <div style={{fontSize:10,color:'var(--dm)',fontWeight:700,textTransform:'uppercase',letterSpacing:1,marginBottom:6,fontFamily:"'Barlow Condensed'"}}>{rn(rd.rd)}</div>
-            <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>{rd.m.map((g,gi)=><BG key={gi} a={g.a} h={g.h} as={g.as} hs={g.hs} goT={goT}/>)}</div>
+        <div key={conf.l} style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:14,padding:16}}>
+          <div style={{fontFamily:"'Bebas Neue'",fontSize:20,letterSpacing:1,marginBottom:12,color:conf.c}}>{conf.l} BRACKET</div>
+          {conf.d?.map((rd,ri)=><div key={ri} style={{marginBottom:14}}>
+            <div style={{fontSize:11,color:'var(--dm)',fontWeight:700,textTransform:'uppercase',letterSpacing:1,marginBottom:8,fontFamily:"'Barlow Condensed'"}}>{rn(rd.rd)}</div>
+            <div style={{display:'flex',gap:7,flexWrap:'wrap'}}>{rd.m.map((g,gi)=><BG key={gi} a={g.a} h={g.h} as={g.as} hs={g.hs} goT={goT}/>)}</div>
           </div>)}
         </div>
       ))}
@@ -712,16 +880,14 @@ function calcPreds(players, statsCache, standings) {
 const Predictions = ({goT, players, statsCache, setStatsCache}) => {
   const [sortBy,    setSortBy]    = useState("score");
   const [standings, setStandings] = useState({});
-  const [fetching,  setFetching]  = useState(false);   // background stat fetch
+  const [fetching,  setFetching]  = useState(false);
   const [fetchDone, setFetchDone] = useState(false);
-  const [progress,  setProgress]  = useState(0);       // 0–100
+  const [progress,  setProgress]  = useState(0);
 
   // Fetch real 2024 standings from ESPN on mount
   useEffect(() => {
     espn(`${SITE}/standings?season=2024`).then(d => {
       const map = {};
-      const groups = d?.standings?.entries || d?.children?.flatMap(c => c.standings?.entries || []) || [];
-      // Try nested structure
       const extract = (entries) => {
         for (const e of entries) {
           const ab  = e.team?.abbreviation;
@@ -740,12 +906,10 @@ const Predictions = ({goT, players, statsCache, setStatsCache}) => {
     });
   }, []);
 
-  // Auto-fetch stats for QB+top RB+top WR of every team (1 key player each) so
-  // roster scores aren't all zero on first load. Runs once when players are ready.
+  // Auto-fetch stats for QB+top RB+top WR of every team
   useEffect(() => {
     if (fetchDone || players.length === 0) return;
     setFetching(true);
-    // Pick the #1 QB, top 2 WRs, top RB per team = ~120 players max
     const keyPlayers = [];
     for (const ab of ALL_AB) {
       const roster = players.filter(p => p.tm === ab);
@@ -761,7 +925,6 @@ const Predictions = ({goT, players, statsCache, setStatsCache}) => {
     const total = keyPlayers.length;
     if (total === 0) { setFetching(false); setFetchDone(true); return; }
 
-    // Fetch in batches of 8 to avoid flooding the API
     const runBatch = async (batch) => {
       await Promise.allSettled(batch.map(p =>
         fetchPlayerStats(p.id).then(data => {
@@ -801,34 +964,34 @@ const Predictions = ({goT, players, statsCache, setStatsCache}) => {
   const hasStandings = Object.keys(standings).length > 0;
 
   const ScoreBar = ({val, max=10, color="var(--em)"}) => (
-    <div style={{display:'flex', alignItems:'center', gap:6}}>
-      <div style={{flex:1, height:5, background:'rgba(255,255,255,.06)', borderRadius:99, overflow:'hidden'}}>
+    <div style={{display:'flex', alignItems:'center', gap:7}}>
+      <div style={{flex:1, height:6, background:'rgba(255,255,255,.06)', borderRadius:99, overflow:'hidden'}}>
         <div style={{width:`${Math.min(100,(val/max)*100)}%`, height:'100%', background:color, borderRadius:99, transition:'width .5s'}}/>
       </div>
-      <span style={{fontSize:10, color:'var(--dm)', minWidth:22, textAlign:'right'}}>{val}</span>
+      <span style={{fontSize:11, color:'var(--dm)', minWidth:24, textAlign:'right'}}>{val}</span>
     </div>
   );
 
   const SortBtn = ({id, label}) => (
-    <button onClick={() => setSortBy(id)} style={{padding:'4px 10px', borderRadius:6, border:'none', background:sortBy===id?'var(--em)':'rgba(255,255,255,.05)', color:sortBy===id?'#000':'var(--dm)', fontWeight:sortBy===id?800:500, fontSize:10, cursor:'pointer', whiteSpace:'nowrap'}}>
+    <button onClick={() => setSortBy(id)} style={{padding:'5px 12px', borderRadius:7, border:'none', background:sortBy===id?'var(--em)':'rgba(255,255,255,.05)', color:sortBy===id?'#000':'var(--dm)', fontWeight:sortBy===id?800:500, fontSize:12, cursor:'pointer', whiteSpace:'nowrap'}}>
       {label}
     </button>
   );
 
-  return <div className="fu" style={{maxWidth:1320, margin:'0 auto', padding:'20px 16px'}}>
+  return <div className="fu" style={{maxWidth:1400, margin:'0 auto', padding:'24px 20px'}}>
 
     {/* Header */}
-    <div style={{background:'var(--s1)', border:'1px solid var(--bd)', borderRadius:12, padding:16, marginBottom:14}}>
-      <div style={{display:'flex', alignItems:'flex-start', justifyContent:'space-between', flexWrap:'wrap', gap:10}}>
+    <div style={{background:'var(--s1)', border:'1px solid var(--bd)', borderRadius:14, padding:18, marginBottom:16}}>
+      <div style={{display:'flex', alignItems:'flex-start', justifyContent:'space-between', flexWrap:'wrap', gap:12}}>
         <div>
-          <h2 style={{fontFamily:"'Bebas Neue'", fontSize:22, letterSpacing:1, marginBottom:4}}>2025–2027 WIN PROJECTIONS</h2>
-          <p style={{color:'var(--dm)', fontSize:12, maxWidth:580, lineHeight:1.5}}>
+          <h2 style={{fontFamily:"'Bebas Neue'", fontSize:26, letterSpacing:1, marginBottom:5}}>2025–2027 WIN PROJECTIONS</h2>
+          <p style={{color:'var(--dm)', fontSize:14, maxWidth:600, lineHeight:1.6}}>
             <span style={{color:'var(--vi)'}}>35%</span> playoff history (2017–24) · <span style={{color:'var(--sk)'}}>45%</span> roster quality · <span style={{color:'var(--lm)'}}>20%</span> 2024 record{hasStandings ? " ✓" : " (loading…)"}.
             Fetching key player stats automatically to power roster scores.
           </p>
         </div>
-        <div style={{display:'flex', gap:4, flexWrap:'wrap', alignItems:'center'}}>
-          <span style={{fontSize:10, color:'var(--dm)', marginRight:2}}>Sort:</span>
+        <div style={{display:'flex', gap:5, flexWrap:'wrap', alignItems:'center'}}>
+          <span style={{fontSize:12, color:'var(--dm)', marginRight:3}}>Sort:</span>
           <SortBtn id="score"  label="Overall"/>
           <SortBtn id="p25"    label="2025 W"/>
           <SortBtn id="w24"    label="2024 W"/>
@@ -840,12 +1003,12 @@ const Predictions = ({goT, players, statsCache, setStatsCache}) => {
 
       {/* Progress bar */}
       {fetching && (
-        <div style={{marginTop:12}}>
-          <div style={{display:'flex', justifyContent:'space-between', fontSize:10, color:'var(--dm)', marginBottom:4}}>
+        <div style={{marginTop:14}}>
+          <div style={{display:'flex', justifyContent:'space-between', fontSize:12, color:'var(--dm)', marginBottom:5}}>
             <span>Fetching player stats to power predictions…</span>
             <span>{progress}%</span>
           </div>
-          <div style={{height:4, background:'rgba(255,255,255,.06)', borderRadius:99, overflow:'hidden'}}>
+          <div style={{height:5, background:'rgba(255,255,255,.06)', borderRadius:99, overflow:'hidden'}}>
             <div style={{width:`${progress}%`, height:'100%', background:'linear-gradient(90deg,var(--em),var(--gd))', borderRadius:99, transition:'width .3s'}}/>
           </div>
         </div>
@@ -853,35 +1016,35 @@ const Predictions = ({goT, players, statsCache, setStatsCache}) => {
     </div>
 
     {/* Tier summary cards */}
-    <div style={{display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:10, marginBottom:14}}>
+    <div style={{display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:12, marginBottom:16}}>
       {["Contender","Playoff","Rebuild","Bottom"].map(tier => {
         const tms = sorted.filter(p => p.tier === tier);
-        return <div key={tier} style={{background:'var(--s1)', border:'1px solid var(--bd)', borderRadius:12, padding:12, borderTop:`3px solid ${tc[tier]}`}}>
-          <div style={{fontSize:9, color:tc[tier], fontWeight:700, textTransform:'uppercase', letterSpacing:1}}>{tier}</div>
-          <div style={{fontFamily:"'Bebas Neue'", fontSize:28, marginTop:2, marginBottom:6, color:tc[tier]}}>{tms.length}</div>
-          <div style={{display:'flex', flexWrap:'wrap', gap:3}}>{tms.map(t => <Logo key={t.ab} ab={t.ab} sz={22} onClick={()=>goT(t.ab)}/>)}</div>
+        return <div key={tier} style={{background:'var(--s1)', border:'1px solid var(--bd)', borderRadius:14, padding:14, borderTop:`3px solid ${tc[tier]}`}}>
+          <div style={{fontSize:11, color:tc[tier], fontWeight:700, textTransform:'uppercase', letterSpacing:1}}>{tier}</div>
+          <div style={{fontFamily:"'Bebas Neue'", fontSize:32, marginTop:3, marginBottom:8, color:tc[tier]}}>{tms.length}</div>
+          <div style={{display:'flex', flexWrap:'wrap', gap:4}}>{tms.map(t => <Logo key={t.ab} ab={t.ab} sz={26} onClick={()=>goT(t.ab)}/>)}</div>
         </div>;
       })}
     </div>
 
     {/* Main table */}
-    <div style={{background:'var(--s1)', border:'1px solid var(--bd)', borderRadius:12, overflow:'hidden'}}>
+    <div style={{background:'var(--s1)', border:'1px solid var(--bd)', borderRadius:14, overflow:'hidden'}}>
       <div style={{overflowX:'auto'}}>
-        <table style={{width:'100%', borderCollapse:'collapse', fontSize:11}}>
+        <table style={{width:'100%', borderCollapse:'collapse', fontSize:13}}>
           <thead>
             <tr style={{borderBottom:'2px solid var(--bd)', background:'rgba(0,0,0,.25)'}}>
-              <th style={{...th, width:30}}>#</th>
+              <th style={{...th, width:32}}>#</th>
               <th style={th}>Team</th>
               <th style={th}>Tier</th>
-              <th style={{...th, width:120}}>Score</th>
-              <th style={{...th, width:100}}>History</th>
-              <th style={{...th, width:100}}>Roster</th>
-              <th style={{...th, width:85}}>QB/WR/RB</th>
-              <th style={{...th, width:50, textAlign:'center'}}>2024 W</th>
-              <th style={{...th, width:55, textAlign:'center'}}>2025</th>
-              <th style={{...th, width:55, textAlign:'center'}}>2026</th>
-              <th style={{...th, width:55, textAlign:'center'}}>2027</th>
-              <th style={{...th, width:52, textAlign:'center'}}>SB %</th>
+              <th style={{...th, width:130}}>Score</th>
+              <th style={{...th, width:110}}>History</th>
+              <th style={{...th, width:110}}>Roster</th>
+              <th style={{...th, width:95}}>QB/WR/RB</th>
+              <th style={{...th, width:55, textAlign:'center'}}>2024 W</th>
+              <th style={{...th, width:60, textAlign:'center'}}>2025</th>
+              <th style={{...th, width:60, textAlign:'center'}}>2026</th>
+              <th style={{...th, width:60, textAlign:'center'}}>2027</th>
+              <th style={{...th, width:56, textAlign:'center'}}>SB %</th>
             </tr>
           </thead>
           <tbody>
@@ -893,14 +1056,14 @@ const Predictions = ({goT, players, statsCache, setStatsCache}) => {
                   onMouseEnter={e=>e.currentTarget.style.background='rgba(255,255,255,.025)'}
                   onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
 
-                  <td style={{...td, color:'var(--dm)', fontWeight:700, fontSize:10}}>{i+1}</td>
+                  <td style={{...td, color:'var(--dm)', fontWeight:700, fontSize:12}}>{i+1}</td>
 
                   <td style={td}>
-                    <div style={{display:'flex', alignItems:'center', gap:7}}>
-                      <Logo ab={p.ab} sz={26}/>
+                    <div style={{display:'flex', alignItems:'center', gap:8}}>
+                      <Logo ab={p.ab} sz={30}/>
                       <div>
-                        <div style={{fontWeight:800, fontSize:12}}>{p.ab}</div>
-                        <div style={{color:'var(--dm)', fontSize:9, whiteSpace:'nowrap'}}>{TM[p.ab]?.c} {TM[p.ab]?.n}</div>
+                        <div style={{fontWeight:800, fontSize:14}}>{p.ab}</div>
+                        <div style={{color:'var(--dm)', fontSize:11, whiteSpace:'nowrap'}}>{TM[p.ab]?.c} {TM[p.ab]?.n}</div>
                       </div>
                     </div>
                   </td>
@@ -912,29 +1075,29 @@ const Predictions = ({goT, players, statsCache, setStatsCache}) => {
                   <td style={td}><ScoreBar val={p.rosterScore} color="var(--sk)"/></td>
 
                   <td style={td}>
-                    <div style={{display:'flex', gap:3}}>
-                      <span style={{background:'rgba(249,115,22,.15)', color:'var(--em)', borderRadius:4, padding:'2px 5px', fontSize:9, fontWeight:700, fontFamily:"'Bebas Neue'", letterSpacing:.5}}>QB {p.qbScore}</span>
-                      <span style={{background:'rgba(56,189,248,.15)',  color:'var(--sk)', borderRadius:4, padding:'2px 5px', fontSize:9, fontWeight:700, fontFamily:"'Bebas Neue'", letterSpacing:.5}}>WR {p.wrScore}</span>
-                      <span style={{background:'rgba(34,197,94,.15)',   color:'var(--lm)', borderRadius:4, padding:'2px 5px', fontSize:9, fontWeight:700, fontFamily:"'Bebas Neue'", letterSpacing:.5}}>RB {p.rbScore}</span>
+                    <div style={{display:'flex', gap:4}}>
+                      <span style={{background:'rgba(249,115,22,.15)', color:'var(--em)', borderRadius:5, padding:'2px 6px', fontSize:10, fontWeight:700, fontFamily:"'Bebas Neue'", letterSpacing:.5}}>QB {p.qbScore}</span>
+                      <span style={{background:'rgba(56,189,248,.15)',  color:'var(--sk)', borderRadius:5, padding:'2px 6px', fontSize:10, fontWeight:700, fontFamily:"'Bebas Neue'", letterSpacing:.5}}>WR {p.wrScore}</span>
+                      <span style={{background:'rgba(34,197,94,.15)',   color:'var(--lm)', borderRadius:5, padding:'2px 6px', fontSize:10, fontWeight:700, fontFamily:"'Bebas Neue'", letterSpacing:.5}}>RB {p.rbScore}</span>
                     </div>
                   </td>
 
                   {/* 2024 actual record */}
                   <td style={{...td, textAlign:'center'}}>
                     {p.actualW24 !== null
-                      ? <span style={{fontFamily:"'Bebas Neue'", fontSize:16, color: p.actualW24>=10?'var(--lm)':p.actualW24>=7?'var(--gd)':'var(--rs)'}}>{p.actualW24}-{standings[p.ab]?.losses??""}</span>
-                      : <span style={{color:'var(--dm)', fontSize:10}}>—</span>}
+                      ? <span style={{fontFamily:"'Bebas Neue'", fontSize:18, color: p.actualW24>=10?'var(--lm)':p.actualW24>=7?'var(--gd)':'var(--rs)'}}>{p.actualW24}-{standings[p.ab]?.losses??""}</span>
+                      : <span style={{color:'var(--dm)', fontSize:12}}>—</span>}
                   </td>
 
                   {/* Projected wins */}
-                  <td style={{...td, textAlign:'center', fontFamily:"'Bebas Neue'", fontSize:20, fontWeight:900, color:'var(--tx)'}}>{p.p25}</td>
-                  <td style={{...td, textAlign:'center', fontFamily:"'Bebas Neue'", fontSize:17, color:'var(--dm)'}}>{p.p26}</td>
-                  <td style={{...td, textAlign:'center', fontFamily:"'Bebas Neue'", fontSize:15, color:'rgba(232,236,248,.3)'}}>{p.p27}</td>
+                  <td style={{...td, textAlign:'center', fontFamily:"'Bebas Neue'", fontSize:22, fontWeight:900, color:'var(--tx)'}}>{p.p25}</td>
+                  <td style={{...td, textAlign:'center', fontFamily:"'Bebas Neue'", fontSize:19, color:'var(--dm)'}}>{p.p26}</td>
+                  <td style={{...td, textAlign:'center', fontFamily:"'Bebas Neue'", fontSize:16, color:'rgba(232,236,248,.3)'}}>{p.p27}</td>
 
                   {/* SB donut */}
                   <td style={{...td, textAlign:'center'}}>
-                    <div style={{display:'inline-flex', alignItems:'center', justifyContent:'center', width:32, height:32, borderRadius:'50%', background:`conic-gradient(var(--gd) ${p.sbOdds*3.6}deg, rgba(255,255,255,.06) 0)`, position:'relative'}}>
-                      <div style={{position:'absolute', inset:4, borderRadius:'50%', background:'var(--s1)', display:'flex', alignItems:'center', justifyContent:'center', fontSize:7, fontWeight:800, color:'var(--gd)'}}>{p.sbOdds}%</div>
+                    <div style={{display:'inline-flex', alignItems:'center', justifyContent:'center', width:36, height:36, borderRadius:'50%', background:`conic-gradient(var(--gd) ${p.sbOdds*3.6}deg, rgba(255,255,255,.06) 0)`, position:'relative'}}>
+                      <div style={{position:'absolute', inset:4, borderRadius:'50%', background:'var(--s1)', display:'flex', alignItems:'center', justifyContent:'center', fontSize:8, fontWeight:800, color:'var(--gd)'}}>{p.sbOdds}%</div>
                     </div>
                   </td>
                 </tr>
@@ -945,7 +1108,7 @@ const Predictions = ({goT, players, statsCache, setStatsCache}) => {
       </div>
     </div>
 
-    <div style={{marginTop:10, color:'var(--dm)', fontSize:10, padding:'0 4px', lineHeight:1.6}}>
+    <div style={{marginTop:12, color:'var(--dm)', fontSize:12, padding:'0 4px', lineHeight:1.7}}>
       * History: 2017–2024 playoff results (recency-weighted) · Roster: top-player fantasy-point averages · 2024 record from ESPN standings · SB % is relative, not absolute.
     </div>
   </div>;
@@ -981,7 +1144,7 @@ export default function App() {
     {tab==="Games"&&<GamesFetch goT={goT}/>}
     {tab==="Brackets"&&<Brackets goT={goT}/>}
     {tab==="Predictions"&&<Predictions goT={goT} players={players} statsCache={statsCache} setStatsCache={setStatsCache}/>}
-    <div style={{textAlign:'center',padding:'20px 16px',color:'var(--dm)',fontSize:10,borderTop:'1px solid var(--bd)',marginTop:30}}>
+    <div style={{textAlign:'center',padding:'22px 20px',color:'var(--dm)',fontSize:12,borderTop:'1px solid var(--bd)',marginTop:32}}>
       <span style={{fontFamily:"'Bebas Neue'",letterSpacing:1}}>GRIDIRON INTEL</span> • Powered by ESPN Public API • Real-time data from site.api.espn.com
     </div>
   </div>;
