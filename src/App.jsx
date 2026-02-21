@@ -832,7 +832,8 @@ function calcPreds(players, statsCache, standings) {
   const histVals = ALL_AB.map(ab => { const h = HIST[ab]||{}; return (h.recentScore||0)+(h.sbWins||0)+(h.deepRuns||0); });
   const maxHist = histVals.length ? Math.max(...histVals) : 1;
 
-  return ALL_AB.map(ab => {
+  // First pass — compute scores and win projections
+  const items = ALL_AB.map(ab => {
     const roster  = players.filter(p => p.tm === ab);
     const h       = HIST[ab] || {};
     const stand   = standings[ab] || null;
@@ -858,13 +859,13 @@ function calcPreds(players, statsCache, standings) {
     const recScore = actualW24 !== null ? (actualW24 / 17) * 10 : histScore;
     const score = histScore * 0.35 + rosterScore * 0.45 + recScore * 0.20;
 
-    // Project wins: anchor off actual 2024 record when available, else score-based
+    // Estimate 2025 wins as intermediate, then project 2026 / 2027 / 2028
     const base24 = actualW24 !== null ? actualW24 : 4 + score * 1.1;
-    const p25 = Math.round(Math.min(15, Math.max(3, base24 * 0.92 + score * 0.18)));
-    const p26 = Math.round(Math.min(15, Math.max(3, p25 * 0.93 + score * 0.12)));
-    const p27 = Math.round(Math.min(15, Math.max(3, p26 * 0.91 + score * 0.10)));
+    const est25  = base24 * 0.92 + score * 0.18;
+    const p26 = Math.round(Math.min(15, Math.max(3, est25)));
+    const p27 = Math.round(Math.min(15, Math.max(3, p26 * 0.93 + score * 0.12)));
+    const p28 = Math.round(Math.min(15, Math.max(3, p27 * 0.91 + score * 0.10)));
 
-    const tier = score >= 7 ? "Contender" : score >= 5 ? "Playoff" : score >= 3 ? "Rebuild" : "Bottom";
     const sbOdds = Math.round(Math.max(1, Math.min(35, score * score * 0.35)));
 
     return {
@@ -872,9 +873,20 @@ function calcPreds(players, statsCache, standings) {
       histScore: +histScore.toFixed(1), rosterScore: +rosterScore.toFixed(1),
       qbScore: +qbScore.toFixed(1), rbScore: +rbScore.toFixed(1),
       wrScore: +wrScore.toFixed(1), teScore: +teScore.toFixed(1),
-      actualW24, tier, p25, p26, p27, sbOdds, hasStats,
+      actualW24, p26, p27, p28, sbOdds, hasStats,
     };
   });
+
+  // Second pass — assign tiers by rank for a realistic NFL distribution:
+  // top 8 = Contender (legit SB threats), next 8 = Playoff (wild-card range),
+  // next 10 = Rebuild, bottom 6 = Bottom
+  const ranked = [...items].sort((a, b) => b.score - a.score);
+  const tierMap = {};
+  ranked.forEach((t, i) => {
+    tierMap[t.ab] = i < 8 ? "Contender" : i < 16 ? "Playoff" : i < 26 ? "Rebuild" : "Bottom";
+  });
+
+  return items.map(t => ({ ...t, tier: tierMap[t.ab] }));
 }
 
 const Predictions = ({goT, players, statsCache, setStatsCache}) => {
@@ -952,7 +964,7 @@ const Predictions = ({goT, players, statsCache, setStatsCache}) => {
   const sorted = useMemo(() => {
     const c = [...preds];
     if (sortBy === "score")  return c.sort((a,b) => b.score - a.score);
-    if (sortBy === "p25")    return c.sort((a,b) => b.p25 - a.p25);
+    if (sortBy === "p26")    return c.sort((a,b) => b.p26 - a.p26);
     if (sortBy === "hist")   return c.sort((a,b) => b.histScore - a.histScore);
     if (sortBy === "roster") return c.sort((a,b) => b.rosterScore - a.rosterScore);
     if (sortBy === "sb")     return c.sort((a,b) => b.sbOdds - a.sbOdds);
@@ -984,7 +996,7 @@ const Predictions = ({goT, players, statsCache, setStatsCache}) => {
     <div style={{background:'var(--s1)', border:'1px solid var(--bd)', borderRadius:14, padding:18, marginBottom:16}}>
       <div style={{display:'flex', alignItems:'flex-start', justifyContent:'space-between', flexWrap:'wrap', gap:12}}>
         <div>
-          <h2 style={{fontFamily:"'Bebas Neue'", fontSize:26, letterSpacing:1, marginBottom:5}}>2025–2027 WIN PROJECTIONS</h2>
+          <h2 style={{fontFamily:"'Bebas Neue'", fontSize:26, letterSpacing:1, marginBottom:5}}>2026–2028 WIN PROJECTIONS</h2>
           <p style={{color:'var(--dm)', fontSize:14, maxWidth:600, lineHeight:1.6}}>
             <span style={{color:'var(--vi)'}}>35%</span> playoff history (2017–24) · <span style={{color:'var(--sk)'}}>45%</span> roster quality · <span style={{color:'var(--lm)'}}>20%</span> 2024 record{hasStandings ? " ✓" : " (loading…)"}.
             Fetching key player stats automatically to power roster scores.
@@ -993,7 +1005,7 @@ const Predictions = ({goT, players, statsCache, setStatsCache}) => {
         <div style={{display:'flex', gap:5, flexWrap:'wrap', alignItems:'center'}}>
           <span style={{fontSize:12, color:'var(--dm)', marginRight:3}}>Sort:</span>
           <SortBtn id="score"  label="Overall"/>
-          <SortBtn id="p25"    label="2025 W"/>
+          <SortBtn id="p26"    label="2026 W"/>
           <SortBtn id="w24"    label="2024 W"/>
           <SortBtn id="hist"   label="History"/>
           <SortBtn id="roster" label="Roster"/>
@@ -1041,9 +1053,9 @@ const Predictions = ({goT, players, statsCache, setStatsCache}) => {
               <th style={{...th, width:110}}>Roster</th>
               <th style={{...th, width:95}}>QB/WR/RB</th>
               <th style={{...th, width:55, textAlign:'center'}}>2024 W</th>
-              <th style={{...th, width:60, textAlign:'center'}}>2025</th>
               <th style={{...th, width:60, textAlign:'center'}}>2026</th>
               <th style={{...th, width:60, textAlign:'center'}}>2027</th>
+              <th style={{...th, width:60, textAlign:'center'}}>2028</th>
               <th style={{...th, width:56, textAlign:'center'}}>SB %</th>
             </tr>
           </thead>
@@ -1090,9 +1102,9 @@ const Predictions = ({goT, players, statsCache, setStatsCache}) => {
                   </td>
 
                   {/* Projected wins */}
-                  <td style={{...td, textAlign:'center', fontFamily:"'Bebas Neue'", fontSize:22, fontWeight:900, color:'var(--tx)'}}>{p.p25}</td>
-                  <td style={{...td, textAlign:'center', fontFamily:"'Bebas Neue'", fontSize:19, color:'var(--dm)'}}>{p.p26}</td>
-                  <td style={{...td, textAlign:'center', fontFamily:"'Bebas Neue'", fontSize:16, color:'rgba(232,236,248,.3)'}}>{p.p27}</td>
+                  <td style={{...td, textAlign:'center', fontFamily:"'Bebas Neue'", fontSize:22, fontWeight:900, color:'var(--tx)'}}>{p.p26}</td>
+                  <td style={{...td, textAlign:'center', fontFamily:"'Bebas Neue'", fontSize:19, color:'var(--dm)'}}>{p.p27}</td>
+                  <td style={{...td, textAlign:'center', fontFamily:"'Bebas Neue'", fontSize:16, color:'rgba(232,236,248,.3)'}}>{p.p28}</td>
 
                   {/* SB donut */}
                   <td style={{...td, textAlign:'center'}}>
