@@ -268,10 +268,20 @@ async function fetchTeamDepthChart(espnTeamId) {
     const pos = item.position?.abbreviation;
     if (!pos || !OFF_POS.has(pos)) continue;
     const ordered = (item.athletes || [])
-      .sort((a, b) => (a.rank || a.slot || 99) - (b.rank || b.slot || 99))
-      .map(a => String(a.athlete?.id || a.id || ""))
+      .sort((a, b) => (a.slot || a.rank || 99) - (b.slot || b.rank || 99))
+      .map(a => {
+        // ESPN athlete field is often a $ref link — extract numeric ID from the URL
+        // e.g. "https://sports.core.api.espn.com/v2/.../athletes/3054211?..."
+        const ref = a.athlete?.['$ref'] || '';
+        if (ref) {
+          const m = ref.match(/athletes\/(\d+)/);
+          if (m) return m[1];
+        }
+        // Fallback: embedded id field
+        return String(a.athlete?.id || a.id || '');
+      })
       .filter(Boolean);
-    chart[pos] = ordered;
+    if (ordered.length > 0) chart[pos] = ordered;
   }
   return chart;
 }
@@ -358,12 +368,27 @@ const DEPTH_LABEL = {
 //  NAV
 // ═══════════════════════════════════════════════════════════════
 const TABS = ["Home","Players","Teams","Games","Brackets","Predictions"];
-const Nav = ({tab,go}) => (
+const Nav = ({tab, go, goBack, canGoBack}) => (
   <div style={{position:'sticky',top:0,zIndex:50,background:'rgba(4,6,12,.85)',backdropFilter:'blur(18px)',borderBottom:'1px solid var(--bd)'}}>
     <div style={{maxWidth:1400,margin:'0 auto',display:'flex',alignItems:'center',justifyContent:'space-between',padding:'0 20px',height:58}}>
-      <div style={{display:'flex',alignItems:'center',gap:9,cursor:'pointer'}} onClick={()=>go("Home")}>
-        <div style={{width:34,height:34,borderRadius:9,background:'linear-gradient(135deg,var(--em),var(--gd))',display:'flex',alignItems:'center',justifyContent:'center',fontFamily:"'Bebas Neue'",fontSize:16,color:'#000'}}>GI</div>
-        <span style={{fontFamily:"'Bebas Neue'",fontSize:20,letterSpacing:2}}>GRIDIRON <span style={{color:'var(--em)'}}>INTEL</span></span>
+      <div style={{display:'flex',alignItems:'center',gap:8}}>
+        {/* Back button — only visible when history exists */}
+        {canGoBack && (
+          <button onClick={goBack} title="Go back" style={{
+            width:32, height:32, borderRadius:8, border:'1px solid var(--bd)',
+            background:'rgba(255,255,255,.06)', color:'var(--tx)', fontSize:18,
+            cursor:'pointer', display:'flex', alignItems:'center', justifyContent:'center',
+            lineHeight:1, flexShrink:0, transition:'all .15s',
+          }}
+          onMouseEnter={e=>{e.currentTarget.style.background='rgba(249,115,22,.15)';e.currentTarget.style.borderColor='rgba(249,115,22,.4)';e.currentTarget.style.color='var(--em)'}}
+          onMouseLeave={e=>{e.currentTarget.style.background='rgba(255,255,255,.06)';e.currentTarget.style.borderColor='var(--bd)';e.currentTarget.style.color='var(--tx)'}}>
+            ←
+          </button>
+        )}
+        <div style={{display:'flex',alignItems:'center',gap:9,cursor:'pointer'}} onClick={()=>go("Home")}>
+          <div style={{width:34,height:34,borderRadius:9,background:'linear-gradient(135deg,var(--em),var(--gd))',display:'flex',alignItems:'center',justifyContent:'center',fontFamily:"'Bebas Neue'",fontSize:16,color:'#000'}}>GI</div>
+          <span style={{fontFamily:"'Bebas Neue'",fontSize:20,letterSpacing:2}}>GRIDIRON <span style={{color:'var(--em)'}}>INTEL</span></span>
+        </div>
       </div>
       <div style={{display:'flex',gap:3,flexWrap:'wrap'}}>{TABS.map(t=><button key={t} onClick={()=>go(t)} style={{padding:'7px 16px',borderRadius:8,border:'none',background:tab===t?'var(--em)':'transparent',color:tab===t?'#000':'var(--tx)',fontWeight:tab===t?800:500,fontSize:14,cursor:'pointer',fontFamily:"'Barlow'"}}>{t}</button>)}</div>
     </div>
@@ -1315,6 +1340,7 @@ export default function App() {
   const[selP,setSelP]=useState(null);
   const[selT,setSelT]=useState(null);
   const[statsCache,setStatsCache]=useState({});
+  const[tabHistory,setTabHistory]=useState([]);
 
   // Fetch all rosters on mount
   useEffect(()=>{
@@ -1324,11 +1350,20 @@ export default function App() {
     }).catch(()=>setLoading(false));
   },[]);
 
-  const go = t=>{setTab(t);window.scrollTo(0,0)};
-  const goT = ab=>{setSelT(ab);setTab("Teams");window.scrollTo(0,0)};
-  const goP = id=>{setSelP(id);setTab("Players");window.scrollTo(0,0)};
+  // Navigation helpers — push current tab to history before switching
+  const go = t => { setTabHistory(h=>[...h,tab]); setTab(t); window.scrollTo(0,0); };
+  const goT = ab => { setTabHistory(h=>[...h,tab]); setSelT(ab); setTab("Teams"); window.scrollTo(0,0); };
+  const goP = id => { setTabHistory(h=>[...h,tab]); setSelP(id); setTab("Players"); window.scrollTo(0,0); };
+  const goBack = () => {
+    const prev = tabHistory[tabHistory.length-1];
+    if (!prev) return;
+    setTabHistory(h=>h.slice(0,-1));
+    setTab(prev);
+    window.scrollTo(0,0);
+  };
 
-  return <div><style>{CSS}</style><Nav tab={tab} go={go}/>
+  return <div><style>{CSS}</style>
+    <Nav tab={tab} go={go} goBack={goBack} canGoBack={tabHistory.length>0}/>
     {tab==="Home"&&<Home go={go} goT={goT} players={players} loading={loading}/>}
     {tab==="Players"&&<Players players={players} loading={loading} sel={selP} setSel={setSelP} goT={goT} statsCache={statsCache} setStatsCache={setStatsCache}/>}
     {tab==="Teams"&&<Teams sel={selT} setSel={setSelT} players={players} goP={goP}/>}
