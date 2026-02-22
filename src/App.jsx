@@ -327,6 +327,21 @@ function calcPlayerSeasonProjection(allStats, forYear) {
   return wt > 0 ? Math.round(proj / wt) : 0;
 }
 
+// Weighted recent PPR score for a single player — used for stat-based depth ranking
+function playerStatScore(player, statsCache) {
+  const st = statsCache?.[player.id];
+  if (!st) return -1;
+  const years = Object.keys(st).map(Number).sort((a, b) => b - a).slice(0, 3);
+  if (!years.length) return -1;
+  const weights = [3, 2, 1];
+  let total = 0, wt = 0;
+  for (let i = 0; i < years.length; i++) {
+    const fpts = st[years[i]]?.fpts || 0;
+    if (fpts > 0) { total += fpts * weights[i]; wt += weights[i]; }
+  }
+  return wt > 0 ? total / wt : 0;
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  CSS
 // ═══════════════════════════════════════════════════════════════
@@ -667,7 +682,7 @@ const Players = ({players,loading,sel,setSel,goT,statsCache,setStatsCache}) => {
 // ═══════════════════════════════════════════════════════════════
 //  TEAMS PAGE
 // ═══════════════════════════════════════════════════════════════
-const Teams = ({sel,setSel,players,goP}) => {
+const Teams = ({sel,setSel,players,goP,statsCache}) => {
   const[conf,setConf]=useState("ALL");
   const[depthChart,setDepthChart]=useState({});
   const[loadingDepth,setLoadingDepth]=useState(false);
@@ -689,21 +704,39 @@ const Teams = ({sel,setSel,players,goP}) => {
     }).catch(()=>setLoadingDepth(false));
   },[sel]);
 
-  // Sort a position group using depth chart order; fall back to jersey # sort
+  // Sort a position group:
+  //   1. Official ESPN depth chart if available
+  //   2. Stats-based (weighted recent PPR) for players not in the chart or when no chart
+  //   3. Experience years as final tiebreaker — never raw jersey number
   const sortByDepth = (group, pos) => {
     const order = depthChart[pos];
+    const statSort = (a, b) => {
+      const as = playerStatScore(a, statsCache);
+      const bs = playerStatScore(b, statsCache);
+      if (as !== -1 && bs !== -1 && as !== bs) return bs - as;  // higher stats first
+      if (as !== -1 && bs === -1) return -1;   // a has stats, b doesn't
+      if (as === -1 && bs !== -1) return 1;    // b has stats, a doesn't
+      // No stats for either — use experience then age
+      const ae = a.exp ?? -1, be = b.exp ?? -1;
+      if (ae !== be) return be - ae;
+      return (b.age || 0) - (a.age || 0);
+    };
+
     if (order && order.length > 0) {
-      return [...group].sort((a,b)=>{
+      return [...group].sort((a, b) => {
         const ai = order.indexOf(String(a.id));
         const bi = order.indexOf(String(b.id));
-        if (ai === -1 && bi === -1) return (+a.n||99)-(+b.n||99);
-        if (ai === -1) return 1;
-        if (bi === -1) return -1;
-        return ai - bi;
+        if (ai !== -1 && bi !== -1) return ai - bi;   // both in official chart
+        if (ai !== -1) return -1;                      // a is charted, b isn't
+        if (bi !== -1) return 1;                       // b is charted, a isn't
+        return statSort(a, b);                         // neither charted → stats
       });
     }
-    return [...group].sort((a,b)=>(+a.n||99)-(+b.n||99));
+    // No official chart at all → rank entirely by stats/experience
+    return [...group].sort(statSort);
   };
+
+  const hasOfficialChart = Object.keys(depthChart).length > 0;
 
   return <div className="fu" style={{maxWidth:1400,margin:'0 auto',padding:'24px 20px'}}><div style={{display:'grid',gridTemplateColumns:'280px 1fr',gap:18}}>
     <div>
@@ -722,9 +755,9 @@ const Teams = ({sel,setSel,players,goP}) => {
           </div>
           {loadingDepth
             ? <span style={{color:'var(--dm)',fontSize:11,fontStyle:'italic'}}>Loading depth chart…</span>
-            : Object.keys(depthChart).length > 0
+            : hasOfficialChart
               ? <Pil ch="OFFICIAL DEPTH CHART" c="var(--lm)" s={{fontSize:10}}/>
-              : <Pil ch="DEPTH BY ROSTER ORDER" c="var(--dm)" s={{fontSize:10}}/>
+              : <Pil ch="STATS-BASED RANKING" c="var(--sk)" s={{fontSize:10}}/>
           }
         </div>
         {["QB","RB","WR","TE"].map(pos=>{
@@ -1366,7 +1399,7 @@ export default function App() {
     <Nav tab={tab} go={go} goBack={goBack} canGoBack={tabHistory.length>0}/>
     {tab==="Home"&&<Home go={go} goT={goT} players={players} loading={loading}/>}
     {tab==="Players"&&<Players players={players} loading={loading} sel={selP} setSel={setSelP} goT={goT} statsCache={statsCache} setStatsCache={setStatsCache}/>}
-    {tab==="Teams"&&<Teams sel={selT} setSel={setSelT} players={players} goP={goP}/>}
+    {tab==="Teams"&&<Teams sel={selT} setSel={setSelT} players={players} goP={goP} statsCache={statsCache}/>}
     {tab==="Games"&&<GamesFetch goT={goT}/>}
     {tab==="Brackets"&&<Brackets goT={goT}/>}
     {tab==="Predictions"&&<Predictions goT={goT} players={players} statsCache={statsCache} setStatsCache={setStatsCache}/>}
