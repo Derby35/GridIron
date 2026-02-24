@@ -1,5 +1,6 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { BarChart, Bar, LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, AreaChart, Area, CartesianGrid, Cell, Legend } from "recharts";
+import { rankPlayers, computeVolumeScore, computeEfficiencyScore, computeTrendScore } from "./lib/projectionEngine.js";
 
 // ═══════════════════════════════════════════════════════════════
 //  ESPN API ENDPOINTS (from Public-ESPN-API docs)
@@ -382,7 +383,7 @@ const DEPTH_LABEL = {
 // ═══════════════════════════════════════════════════════════════
 //  NAV
 // ═══════════════════════════════════════════════════════════════
-const TABS = ["Home","Players","Teams","Games","Brackets","Predictions"];
+const TABS = ["Home","Players","Teams","Games","Brackets","Predictions","Rankings"];
 const Nav = ({tab, go, goBack, canGoBack}) => (
   <div style={{position:'sticky',top:0,zIndex:50,background:'rgba(4,6,12,.85)',backdropFilter:'blur(18px)',borderBottom:'1px solid var(--bd)'}}>
     <div style={{maxWidth:1400,margin:'0 auto',display:'flex',alignItems:'center',justifyContent:'space-between',padding:'0 20px',height:58}}>
@@ -1364,6 +1365,332 @@ const Predictions = ({goT, players, statsCache, setStatsCache}) => {
 };
 
 // ═══════════════════════════════════════════════════════════════
+//  RANKINGS — Opportunity-first fantasy projection system
+// ═══════════════════════════════════════════════════════════════
+const SCORE_COLORS = { volume:'var(--em)', efficiency:'var(--sk)', trend:'var(--lm)', matchup:'var(--vi)' };
+
+const Rankings = ({players, statsCache, setStatsCache, goT, goP}) => {
+  const [q,         setQ]         = useState("");
+  const [posFilter, setPosFilter] = useState("ALL");
+  const [sortKey,   setSortKey]   = useState("projection");
+  const [expanded,  setExpanded]  = useState(null);
+  const [fetching,  setFetching]  = useState(false);
+  const [fetchDone, setFetchDone] = useState(false);
+  const [progress,  setProgress]  = useState(0);
+
+  // Auto-fetch stats for every offensive player in batches of 8
+  useEffect(() => {
+    if (fetchDone || players.length === 0) return;
+    const needed = players.filter(p => !statsCache[p.id]);
+    if (!needed.length) { setFetchDone(true); return; }
+    setFetching(true);
+    let done = 0;
+    const total = needed.length;
+    (async () => {
+      for (let i = 0; i < needed.length; i += 8) {
+        await Promise.allSettled(needed.slice(i, i + 8).map(p =>
+          fetchPlayerStats(p.id).then(data => {
+            setStatsCache(prev => ({...prev, [p.id]: data || {}}));
+            done++;
+            setProgress(Math.round((done / total) * 100));
+          }).catch(() => { done++; setProgress(Math.round((done / total) * 100)); })
+        ));
+      }
+      setFetching(false);
+      setFetchDone(true);
+    })();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [players, fetchDone]);
+
+  const ranked = useMemo(() => rankPlayers(players, statsCache), [players, statsCache]);
+
+  const displayed = useMemo(() => {
+    let list = posFilter === "ALL" ? ranked : ranked.filter(p => p.pos === posFilter);
+    if (q) {
+      const lq = q.toLowerCase();
+      list = list.filter(p => p.nm.toLowerCase().includes(lq) || p.tm.toLowerCase().includes(lq));
+    }
+    const fns = {
+      projection: (a,b) => b.projection - a.projection,
+      volume:     (a,b) => b.volume - a.volume,
+      efficiency: (a,b) => b.efficiency - a.efficiency,
+      trend:      (a,b) => b.trend - a.trend,
+      matchup:    (a,b) => b.matchup - a.matchup,
+    };
+    return [...list].sort(fns[sortKey] || fns.projection);
+  }, [ranked, posFilter, q, sortKey]);
+
+  const MiniBar = ({val, color}) => (
+    <div style={{display:'flex', alignItems:'center', gap:5}}>
+      <div style={{flex:1, height:5, background:'rgba(255,255,255,.07)', borderRadius:99, overflow:'hidden'}}>
+        <div style={{width:`${(val/10)*100}%`, height:'100%', background:color, borderRadius:99, transition:'width .4s'}}/>
+      </div>
+      <span style={{fontSize:11, color:'var(--dm)', minWidth:28, textAlign:'right', fontFamily:"'Bebas Neue'", letterSpacing:.5}}>{val}</span>
+    </div>
+  );
+
+  const projColor = v => v >= 7 ? 'var(--lm)' : v >= 5 ? 'var(--gd)' : v >= 3 ? 'var(--em)' : 'var(--rs)';
+
+  return <div className="fu" style={{maxWidth:1400, margin:'0 auto', padding:'24px 20px'}}>
+
+    {/* ── Header ── */}
+    <div style={{background:'var(--s1)', border:'1px solid var(--bd)', borderRadius:14, padding:18, marginBottom:16}}>
+      <div style={{display:'flex', alignItems:'flex-start', justifyContent:'space-between', flexWrap:'wrap', gap:12, marginBottom:12}}>
+        <div>
+          <h2 style={{fontFamily:"'Bebas Neue'", fontSize:28, letterSpacing:1.5, marginBottom:4}}>
+            OPPORTUNITY-FIRST RANKINGS
+          </h2>
+          <p style={{color:'var(--dm)', fontSize:13, lineHeight:1.7}}>
+            <span style={{color:'var(--em)',  fontWeight:700}}>40% Volume</span> ·{' '}
+            <span style={{color:'var(--sk)',  fontWeight:700}}>25% Efficiency</span> ·{' '}
+            <span style={{color:'var(--lm)', fontWeight:700}}>20% Trend</span> ·{' '}
+            <span style={{color:'var(--vi)', fontWeight:700}}>15% Matchup</span>
+            <span style={{color:'var(--dm)', fontSize:11}}> · click any row to see the breakdown</span>
+          </p>
+        </div>
+        {/* Position filter */}
+        <div style={{display:'flex', gap:4}}>
+          {["ALL","QB","RB","WR","TE"].map(p => (
+            <button key={p} onClick={() => setPosFilter(p)} style={{
+              padding:'6px 13px', borderRadius:7, border:'none', cursor:'pointer', fontSize:12, fontWeight:600,
+              background: posFilter===p ? (p==="ALL"?'var(--em)':posColor(p)) : 'rgba(255,255,255,.05)',
+              color: posFilter===p ? '#000' : 'var(--dm)',
+            }}>{p}</button>
+          ))}
+        </div>
+      </div>
+
+      {/* Search + sort row */}
+      <div style={{display:'flex', gap:8, flexWrap:'wrap', alignItems:'center'}}>
+        <input value={q} onChange={e=>setQ(e.target.value)} placeholder="Search player or team…"
+          style={{flex:1, minWidth:180, padding:'9px 13px', borderRadius:9, border:'1px solid var(--bd)',
+                  background:'rgba(0,0,0,.3)', color:'var(--tx)', outline:'none', fontSize:13}}/>
+        <div style={{display:'flex', gap:4, flexWrap:'wrap'}}>
+          {[['projection','Overall'],['volume','Volume'],['efficiency','Efficiency'],['trend','Trend'],['matchup','Matchup']].map(([k,l]) => (
+            <button key={k} onClick={() => setSortKey(k)} style={{
+              padding:'5px 12px', borderRadius:7, border:'none', cursor:'pointer', fontSize:12, whiteSpace:'nowrap',
+              background: sortKey===k ? 'var(--em)' : 'rgba(255,255,255,.05)',
+              color: sortKey===k ? '#000' : 'var(--dm)', fontWeight: sortKey===k ? 800 : 500,
+            }}>{l}</button>
+          ))}
+        </div>
+      </div>
+
+      {/* Progress bar */}
+      {fetching && (
+        <div style={{marginTop:12}}>
+          <div style={{display:'flex', justifyContent:'space-between', fontSize:12, color:'var(--dm)', marginBottom:4}}>
+            <span>Fetching player stats for projections… ({displayed.filter(p=>p.hasData).length} ready)</span>
+            <span>{progress}%</span>
+          </div>
+          <div style={{height:4, background:'rgba(255,255,255,.06)', borderRadius:99, overflow:'hidden'}}>
+            <div style={{width:`${progress}%`, height:'100%', background:'linear-gradient(90deg,var(--em),var(--gd))', borderRadius:99, transition:'width .3s'}}/>
+          </div>
+        </div>
+      )}
+    </div>
+
+    {/* ── Stat summary cards ── */}
+    <div style={{display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:10, marginBottom:14}}>
+      {[
+        {l:"Players Ranked", v:displayed.length,                           c:"var(--em)"},
+        {l:"With Stat Data",  v:displayed.filter(p=>p.hasData).length,    c:"var(--lm)"},
+        {l:"Top Projection",  v:displayed[0]?.projection ?? "—",          c:"var(--gd)"},
+        {l:"Avg Projection",  v:displayed.length ? (displayed.reduce((s,p)=>s+p.projection,0)/displayed.length).toFixed(1) : "—", c:"var(--sk)"},
+      ].map(({l,v,c}) => <StCard key={l} l={l} v={v} c={c}/>)}
+    </div>
+
+    {/* ── Main table ── */}
+    <div style={{background:'var(--s1)', border:'1px solid var(--bd)', borderRadius:14, overflow:'hidden'}}>
+      <div style={{overflowX:'auto'}}>
+        <table style={{width:'100%', borderCollapse:'collapse'}}>
+          <thead>
+            <tr style={{borderBottom:'2px solid var(--bd)', background:'rgba(0,0,0,.25)'}}>
+              <th style={{...th, width:36}}>#</th>
+              <th style={th}>Player</th>
+              <th style={{...th, width:46}}>Pos</th>
+              <th style={{...th, width:60}}>Team</th>
+              <th style={{...th, width:130}}>Projection</th>
+              <th style={{...th, width:115, color:'var(--em)'}}>Volume <span style={{fontSize:9, fontWeight:400}}>(40%)</span></th>
+              <th style={{...th, width:115, color:'var(--sk)'}}>Efficiency <span style={{fontSize:9, fontWeight:400}}>(25%)</span></th>
+              <th style={{...th, width:115, color:'var(--lm)'}}>Trend <span style={{fontSize:9, fontWeight:400}}>(20%)</span></th>
+              <th style={{...th, width:115, color:'var(--vi)'}}>Matchup <span style={{fontSize:9, fontWeight:400}}>(15%)</span></th>
+              <th style={{...th, width:36}}/>
+            </tr>
+          </thead>
+          <tbody>
+            {displayed.flatMap((p, i) => {
+              const isOpen = expanded === p.id;
+              const pc = posColor(p.pos);
+              const rows = [];
+
+              // Main row
+              rows.push(
+                <tr key={p.id}
+                  style={{borderBottom: isOpen ? 'none' : '1px solid var(--bd)', cursor:'pointer', transition:'background .1s'}}
+                  onMouseEnter={e => e.currentTarget.style.background='rgba(255,255,255,.025)'}
+                  onMouseLeave={e => e.currentTarget.style.background='transparent'}
+                  onClick={() => setExpanded(isOpen ? null : p.id)}>
+
+                  <td style={{...td, color:'var(--dm)', fontWeight:700, fontSize:12}}>{i+1}</td>
+
+                  {/* Player */}
+                  <td style={td}>
+                    <div style={{display:'flex', alignItems:'center', gap:10}}>
+                      <img src={p.hs} alt={p.nm} width={40} height={40} className="hs"
+                        onClick={e=>{e.stopPropagation();goP(p.id)}}
+                        onError={e=>{e.target.style.opacity='.2'}}/>
+                      <div>
+                        <div style={{fontWeight:800, fontSize:14, cursor:'pointer'}}
+                          onClick={e=>{e.stopPropagation();goP(p.id)}}>{p.nm}</div>
+                        {!p.hasData && <span style={{fontSize:10, color:'var(--rs)', fontStyle:'italic'}}>loading…</span>}
+                      </div>
+                    </div>
+                  </td>
+
+                  <td style={td}><Pil ch={p.pos} c={pc} s={{padding:'2px 7px', fontSize:10}}/></td>
+
+                  {/* Team logo */}
+                  <td style={td}>
+                    <div style={{display:'flex', alignItems:'center', gap:5, cursor:'pointer'}}
+                      onClick={e=>{e.stopPropagation();goT(p.tm)}}>
+                      <Logo ab={p.tm} sz={22}/>
+                      <span style={{fontSize:12, color:'var(--dm)'}}>{p.tm}</span>
+                    </div>
+                  </td>
+
+                  {/* Overall projection */}
+                  <td style={td}>
+                    <div style={{display:'flex', alignItems:'center', gap:8}}>
+                      <span style={{fontFamily:"'Bebas Neue'", fontSize:24, color:projColor(p.projection), minWidth:38, lineHeight:1}}>
+                        {p.projection}
+                      </span>
+                      <div style={{flex:1, height:7, background:'rgba(255,255,255,.06)', borderRadius:99, overflow:'hidden'}}>
+                        <div style={{width:`${(p.projection/10)*100}%`, height:'100%', background:projColor(p.projection), borderRadius:99}}/>
+                      </div>
+                    </div>
+                  </td>
+
+                  {/* Component score bars */}
+                  <td style={td}><MiniBar val={p.volume}     color="var(--em)"/></td>
+                  <td style={td}><MiniBar val={p.efficiency} color="var(--sk)"/></td>
+                  <td style={td}><MiniBar val={p.trend}      color="var(--lm)"/></td>
+                  <td style={td}><MiniBar val={p.matchup}    color="var(--vi)"/></td>
+
+                  {/* Expand toggle */}
+                  <td style={{...td, textAlign:'center', color:'var(--dm)', fontSize:12, userSelect:'none'}}>
+                    {isOpen ? '▲' : '▼'}
+                  </td>
+                </tr>
+              );
+
+              // Expandable "Why this rank?" row
+              if (isOpen) {
+                const rs = p.recentStats;
+                const perGame = (val, div) => div > 0 ? (val / div).toFixed(1) : "—";
+                const gp = rs?.gp || 1;
+                rows.push(
+                  <tr key={`${p.id}_exp`} style={{borderBottom:'1px solid var(--bd)'}}>
+                    <td colSpan={10} style={{padding:'14px 18px', background:'rgba(0,0,0,.18)'}}>
+                      <div style={{fontFamily:"'Bebas Neue'", fontSize:13, letterSpacing:1.5, color:'var(--em)', marginBottom:12}}>
+                        WHY THIS RANK? — {p.nm}
+                      </div>
+                      <div style={{display:'grid', gridTemplateColumns:'repeat(auto-fill,minmax(210px,1fr))', gap:10, marginBottom:12}}>
+                        {[
+                          {
+                            key: 'volume', label:'VOLUME (40%)', color:'var(--em)', score: p.volume,
+                            detail: rs ? (
+                              p.pos==="QB"  ? `${perGame(rs.passAtt||0, gp)} att/g (elite = 38)`  :
+                              p.pos==="RB"  ? `${perGame((rs.rushAtt||0)+(rs.rec||0), gp)} tch/g (elite = 22)` :
+                              `${perGame(rs.tgt||0, gp)} tgt/g (elite = ${p.pos==="TE"?"7":"10"})`
+                            ) : "No recent stats — score estimated",
+                          },
+                          {
+                            key: 'efficiency', label:'EFFICIENCY (25%)', color:'var(--sk)', score: p.efficiency,
+                            detail: rs ? (
+                              p.pos==="QB"  ? `${perGame(rs.passYd||0, Math.max(rs.passAtt||1,1))} yds/att · ${rs.passTD||0} TD · ${rs.passInt||0} INT` :
+                              p.pos==="RB"  ? `${perGame(rs.rushYd||0, Math.max(rs.rushAtt||1,1))} yds/carry · ${rs.rec||0} rec` :
+                              `${perGame(rs.recYd||0, Math.max(rs.tgt||rs.rec||1,1))} yds/tgt · ${rs.recTD||0} TD`
+                            ) : "No recent stats",
+                          },
+                          {
+                            key: 'trend', label:'TREND (20%)', color:'var(--lm)', score: p.trend,
+                            detail: p.recentYear
+                              ? `Based on ${p.recentYear} vs prior season — ${p.trend >= 6 ? "improving ↑" : p.trend >= 5 ? "stable →" : "declining ↓"}`
+                              : "Insufficient history",
+                          },
+                          {
+                            key: 'matchup', label:'MATCHUP (15%)', color:'var(--vi)', score: p.matchup,
+                            detail: "League-average placeholder (5.0). Upgrade MATCHUP_MAP in projectionEngine.js with weekly opponent data.",
+                          },
+                        ].map(item => (
+                          <div key={item.key} style={{background:'rgba(255,255,255,.03)', border:`1px solid ${item.color}22`, borderRadius:10, padding:'10px 13px'}}>
+                            <div style={{fontSize:10, color:item.color, fontWeight:700, fontFamily:"'Barlow Condensed'", letterSpacing:.8, marginBottom:3}}>{item.label}</div>
+                            <div style={{fontFamily:"'Bebas Neue'", fontSize:28, color:item.color, lineHeight:1, marginBottom:4}}>{item.score}</div>
+                            <div style={{fontSize:12, color:'var(--dm)', lineHeight:1.4}}>{item.detail}</div>
+                          </div>
+                        ))}
+                      </div>
+
+                      {/* Formula line */}
+                      <div style={{fontSize:12, color:'var(--dm)', fontFamily:"'Barlow Condensed'", letterSpacing:.3}}>
+                        <span style={{color:'var(--tx)', fontWeight:600}}>Projection = </span>
+                        <span style={{color:'var(--em)'}}>{p.volume}×0.40</span> +{' '}
+                        <span style={{color:'var(--sk)'}}>{p.efficiency}×0.25</span> +{' '}
+                        <span style={{color:'var(--lm)'}}>{p.trend}×0.20</span> +{' '}
+                        <span style={{color:'var(--vi)'}}>{p.matchup}×0.15</span>
+                        <span style={{color:'var(--gd)', fontWeight:700, fontSize:14, marginLeft:8}}> = {p.projection}</span>
+                      </div>
+
+                      {/* Stat pills */}
+                      {rs && (
+                        <div style={{display:'flex', gap:6, flexWrap:'wrap', marginTop:10}}>
+                          <Pil ch={`${rs.gp || "?"} GP`} c="var(--tx)" s={{fontSize:11}}/>
+                          {p.pos==="QB" && <>
+                            <Pil ch={`${(rs.passYd||0).toLocaleString()} pass yds`} c="var(--em)" s={{fontSize:11}}/>
+                            <Pil ch={`${rs.passTD||0} TD`}  c="var(--lm)" s={{fontSize:11}}/>
+                            <Pil ch={`${rs.passInt||0} INT`} c="var(--rs)" s={{fontSize:11}}/>
+                            <Pil ch={`${(rs.rushYd||0).toLocaleString()} rush yds`} c="var(--sk)" s={{fontSize:11}}/>
+                          </>}
+                          {p.pos==="RB" && <>
+                            <Pil ch={`${(rs.rushYd||0).toLocaleString()} rush yds`} c="var(--em)" s={{fontSize:11}}/>
+                            <Pil ch={`${rs.rushTD||0} rush TD`} c="var(--lm)" s={{fontSize:11}}/>
+                            <Pil ch={`${rs.rec||0} rec / ${rs.tgt||"?"} tgt`} c="var(--sk)" s={{fontSize:11}}/>
+                            <Pil ch={`${(rs.recYd||0).toLocaleString()} rec yds`} c="var(--vi)" s={{fontSize:11}}/>
+                          </>}
+                          {(p.pos==="WR"||p.pos==="TE") && <>
+                            <Pil ch={`${rs.tgt||"?"} tgt`}    c="var(--em)" s={{fontSize:11}}/>
+                            <Pil ch={`${rs.rec||0} rec`}       c="var(--sk)" s={{fontSize:11}}/>
+                            <Pil ch={`${(rs.recYd||0).toLocaleString()} yds`} c="var(--lm)" s={{fontSize:11}}/>
+                            <Pil ch={`${rs.recTD||0} TD`}      c="var(--gd)" s={{fontSize:11}}/>
+                          </>}
+                          <Pil ch={`${rs.fpts||0} FPTS`} c="var(--gd)" s={{fontSize:11, fontWeight:800}}/>
+                        </div>
+                      )}
+                    </td>
+                  </tr>
+                );
+              }
+
+              return rows;
+            })}
+          </tbody>
+        </table>
+      </div>
+      {displayed.length === 0 && (
+        <div style={{padding:40, textAlign:'center', color:'var(--dm)'}}>
+          {fetching ? "Loading player stats…" : "No players match your search."}
+        </div>
+      )}
+    </div>
+
+    <div style={{marginTop:12, color:'var(--dm)', fontSize:12, padding:'0 4px', lineHeight:1.7}}>
+      * Volume = opportunity per game · Efficiency = fantasy pts per touch/target · Trend = YoY improvement detector · Matchup = opponent vulnerability (placeholder) · Click any row to see the full formula breakdown.
+    </div>
+  </div>;
+};
+
+// ═══════════════════════════════════════════════════════════════
 //  APP — Main Component
 // ═══════════════════════════════════════════════════════════════
 export default function App() {
@@ -1403,6 +1730,7 @@ export default function App() {
     {tab==="Games"&&<GamesFetch goT={goT}/>}
     {tab==="Brackets"&&<Brackets goT={goT}/>}
     {tab==="Predictions"&&<Predictions goT={goT} players={players} statsCache={statsCache} setStatsCache={setStatsCache}/>}
+    {tab==="Rankings"&&<Rankings players={players} statsCache={statsCache} setStatsCache={setStatsCache} goT={goT} goP={goP}/>}
     <div style={{textAlign:'center',padding:'22px 20px',color:'var(--dm)',fontSize:12,borderTop:'1px solid var(--bd)',marginTop:32}}>
       <span style={{fontFamily:"'Bebas Neue'",letterSpacing:1}}>GRIDIRON INTEL</span> • Powered by ESPN Public API • Real-time data from site.api.espn.com
     </div>
