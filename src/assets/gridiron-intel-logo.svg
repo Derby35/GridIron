@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" fill="none">
+  <!-- Shield base -->
+  <path d="M60 8 L96 22 L96 62 C96 84 78 100 60 112 C42 100 24 84 24 62 L24 22 Z"
+    fill="url(#shieldGrad)" stroke="url(#strokeGrad)" stroke-width="1.5"/>
+  <!-- Inner shield outline -->
+  <path d="M60 16 L90 28 L90 62 C90 81 74 95 60 105 C46 95 30 81 30 62 L30 28 Z"
+    fill="none" stroke="rgba(249,115,22,0.2)" stroke-width="1"/>
+  <!-- Gridiron hash marks (decorative horizontal lines inside shield) -->
+  <line x1="38" y1="54" x2="82" y2="54" stroke="rgba(249,115,22,0.12)" stroke-width="1"/>
+  <line x1="38" y1="68" x2="82" y2="68" stroke="rgba(249,115,22,0.12)" stroke-width="1"/>
+  <!-- GII monogram -->
+  <!-- G -->
+  <text x="36" y="76" font-family="'Arial Black', 'Bebas Neue', sans-serif" font-size="26"
+    font-weight="900" fill="url(#textGrad)" letter-spacing="-1">G</text>
+  <!-- II -->
+  <text x="62" y="76" font-family="'Arial Black', 'Bebas Neue', sans-serif" font-size="26"
+    font-weight="900" fill="url(#accentGrad)" letter-spacing="0">II</text>
+  <!-- Top accent bar -->
+  <rect x="44" y="36" width="32" height="3" rx="1.5" fill="url(#accentGrad)" opacity="0.7"/>
+  <!-- Gradients -->
+  <defs>
+    <linearGradient id="shieldGrad" x1="24" y1="8" x2="96" y2="112" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0F1628"/>
+      <stop offset="100%" stop-color="#04060C"/>
+    </linearGradient>
+    <linearGradient id="strokeGrad" x1="24" y1="8" x2="96" y2="112" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#F97316" stop-opacity="0.8"/>
+      <stop offset="100%" stop-color="#F59E0B" stop-opacity="0.4"/>
+    </linearGradient>
+    <linearGradient id="textGrad" x1="36" y1="50" x2="36" y2="76" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#E8ECF8"/>
+      <stop offset="100%" stop-color="#A0A8C0"/>
+    </linearGradient>
+    <linearGradient id="accentGrad" x1="62" y1="50" x2="62" y2="76" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#F97316"/>
+      <stop offset="100%" stop-color="#F59E0B"/>
+    </linearGradient>
+  </defs>
+</svg>

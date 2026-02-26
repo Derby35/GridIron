@@ -1,6 +1,17 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from "react";
-import { BarChart, Bar, LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, AreaChart, Area, CartesianGrid, Cell, Legend } from "recharts";
-import { rankPlayers, computeVolumeScore, computeEfficiencyScore, computeTrendScore } from "./lib/projectionEngine.js";
+import { BarChart, Bar, LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, AreaChart, Area, CartesianGrid, Cell, Legend, RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis } from "recharts";
+import { rankPlayers } from "./lib/projectionEngine.js";
+import { STATIC_ROSTERS } from "./data/staticData.js";
+import { STATIC_PLAYER_STATS } from "./data/playerStats.js";
+import { STATIC_DEPTH_CHARTS, STATIC_STANDINGS_24, STATIC_STANDINGS_25 } from "./data/teamData.js";
+import "./styles.css";
+import NavBar, { TABS as NAV_TABS } from "./components/Nav.jsx";
+import PlayersPage from "./pages/Players.jsx";
+import HomePage from "./pages/Home.jsx";
+import DraftPage from "./pages/Draft.jsx";
+import ComparePage from "./pages/Compare.jsx";
+import ProspectsPage from "./pages/Prospects.jsx";
+import DefensePage from "./pages/Defense.jsx";
 
 // ═══════════════════════════════════════════════════════════════
 //  ESPN API ENDPOINTS (from Public-ESPN-API docs)
@@ -289,6 +300,97 @@ async function fetchTeamDepthChart(espnTeamId) {
 
 // Map ESPN team abbreviation → ESPN numeric ID
 const AB_TO_TID = Object.fromEntries(Object.entries(TID).map(([k,v])=>[v,k]));
+const COMPARE_COLORS = ["#F97316","#38BDF8","#22C55E","#A78BFA"];
+const SLEEPER = "https://api.sleeper.app/v1";
+
+// ═══════════════════════════════════════════════════════════════
+//  FETCH TEAM DEFENSE STATS — from ESPN team statistics endpoint
+// ═══════════════════════════════════════════════════════════════
+async function fetchTeamDefStats(espnTeamId) {
+  const data = await espn(`${SITE}/teams/${espnTeamId}/statistics`);
+  const def = { ptsAllowed:0, ydsAllowed:0, passYdsAllowed:0, rushYdsAllowed:0, sacks:0, ints:0, fumRec:0, gp:17 };
+  if (!data) return def;
+  // ESPN returns stats in nested structures — traverse all of them
+  const all = [];
+  const walk = (o) => {
+    if (!o) return;
+    if (Array.isArray(o.stats)) all.push(...o.stats);
+    if (o.categories) (Array.isArray(o.categories)?o.categories:[o.categories]).forEach(walk);
+    if (o.splits) walk(o.splits);
+    if (o.results) walk(o.results);
+    if (o.children) o.children.forEach(walk);
+  };
+  walk(data);
+  for (const s of all) {
+    const n = (s.name||s.abbreviation||'').toLowerCase();
+    const v = parseFloat(s.value)||0;
+    if (!v) continue;
+    if (n==='gamesplayed') def.gp = v;
+    if (/pointsagainst|pointsallowed|opponentpoints/.test(n)) def.ptsAllowed = v;
+    if (/totalyardsallowed|netyardsallowed/.test(n)&&!/pass|rush/.test(n)) def.ydsAllowed = v;
+    if (/passingyardsallowed|netpassingyardsallowed/.test(n)) def.passYdsAllowed = v;
+    if (/rushingyardsallowed/.test(n)) def.rushYdsAllowed = v;
+    if (/^sacks$|^totalsacks$|defensivesacks/.test(n)) def.sacks = v;
+    if (/defensiveinterceptions|^interceptions$/.test(n)&&v>2) def.ints = v;
+    if (/fumblerecoveries|forcedfumbles/.test(n)) def.fumRec = v;
+  }
+  return def;
+}
+
+async function fetchAllDefStats() {
+  const res = await Promise.allSettled(
+    ESPN_IDS.map(tid => fetchTeamDefStats(tid).then(def=>({ab:TID[tid],def})))
+  );
+  const map = {};
+  for (const r of res) if(r.status==='fulfilled'&&r.value) map[r.value.ab]=r.value.def;
+  return map;
+}
+
+// Build defense-vs-position rankings from aggregated game logs
+function buildDefRankings(gameLogsCache, players) {
+  const totals = {};
+  for (const [pid, logs] of Object.entries(gameLogsCache)) {
+    const pl = players.find(p=>p.id===pid);
+    if (!pl||!OFF_POS.has(pl.pos)) continue;
+    for (const g of logs) {
+      if (!g.opp) continue;
+      if (!totals[g.opp]) totals[g.opp]={QB:{t:0,c:0},RB:{t:0,c:0},WR:{t:0,c:0},TE:{t:0,c:0}};
+      totals[g.opp][pl.pos].t += g.fpts||0;
+      totals[g.opp][pl.pos].c += 1;
+    }
+  }
+  const ranks = {};
+  for (const [ab,pos] of Object.entries(totals)) {
+    ranks[ab] = {};
+    for (const [p,{t,c}] of Object.entries(pos)) ranks[ab][p] = c>0 ? +(t/c).toFixed(1) : null;
+  }
+  return ranks;
+}
+
+// Defense score 0-10: higher = worse defense = better matchup for offense
+function defMatchupScore(defRanks, oppAb, pos) {
+  if (!defRanks||!defRanks[oppAb]||defRanks[oppAb][pos]==null) return 5;
+  const avg = {QB:22,RB:12,WR:12,TE:8};
+  return Math.min(10,Math.max(0,(defRanks[oppAb][pos]/(avg[pos]||12))*5));
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  SLEEPER API — Trending adds/drops
+// ═══════════════════════════════════════════════════════════════
+async function fetchSleeperTrending(type="add") {
+  const key = `gi_sleeper_${type}`;
+  try {
+    const c = localStorage.getItem(key);
+    if (c) { const {ts,data}=JSON.parse(c); if(Date.now()-ts<3600000) return data; }
+  } catch(e){}
+  try {
+    const r = await fetch(`${SLEEPER}/players/nfl/trending/${type}?lookback_hours=24&limit=25`);
+    if (!r.ok) return [];
+    const data = await r.json();
+    try { localStorage.setItem(key,JSON.stringify({ts:Date.now(),data})); } catch(e){}
+    return data;
+  } catch(e) { return []; }
+}
 
 // ═══════════════════════════════════════════════════════════════
 //  PLAYOFF BRACKETS 2017-2024
@@ -381,47 +483,102 @@ const DEPTH_LABEL = {
 };
 
 // ═══════════════════════════════════════════════════════════════
-//  NAV
+//  COMPARE DRAWER — fixed bottom panel for 2-4 player comparison
 // ═══════════════════════════════════════════════════════════════
-const TABS = ["Home","Players","Teams","Games","Brackets","Predictions","Rankings"];
-const Nav = ({tab, go, goBack, canGoBack}) => (
-  <div style={{position:'sticky',top:0,zIndex:50,background:'rgba(4,6,12,.85)',backdropFilter:'blur(18px)',borderBottom:'1px solid var(--bd)'}}>
-    <div style={{maxWidth:1400,margin:'0 auto',display:'flex',alignItems:'center',justifyContent:'space-between',padding:'0 20px',height:58}}>
-      <div style={{display:'flex',alignItems:'center',gap:8}}>
-        {/* Back button — only visible when history exists */}
-        {canGoBack && (
-          <button onClick={goBack} title="Go back" style={{
-            width:32, height:32, borderRadius:8, border:'1px solid var(--bd)',
-            background:'rgba(255,255,255,.06)', color:'var(--tx)', fontSize:18,
-            cursor:'pointer', display:'flex', alignItems:'center', justifyContent:'center',
-            lineHeight:1, flexShrink:0, transition:'all .15s',
-          }}
-          onMouseEnter={e=>{e.currentTarget.style.background='rgba(249,115,22,.15)';e.currentTarget.style.borderColor='rgba(249,115,22,.4)';e.currentTarget.style.color='var(--em)'}}
-          onMouseLeave={e=>{e.currentTarget.style.background='rgba(255,255,255,.06)';e.currentTarget.style.borderColor='var(--bd)';e.currentTarget.style.color='var(--tx)'}}>
-            ←
-          </button>
-        )}
-        <div style={{display:'flex',alignItems:'center',gap:9,cursor:'pointer'}} onClick={()=>go("Home")}>
-          <div style={{width:34,height:34,borderRadius:9,background:'linear-gradient(135deg,var(--em),var(--gd))',display:'flex',alignItems:'center',justifyContent:'center',fontFamily:"'Bebas Neue'",fontSize:16,color:'#000'}}>GI</div>
-          <span style={{fontFamily:"'Bebas Neue'",fontSize:20,letterSpacing:2}}>GRIDIRON <span style={{color:'var(--em)'}}>INTEL</span></span>
+const CompareDrawer = ({ids, players, statsCache, onClose, goP}) => {
+  if (ids.length < 2) return null;
+  const pls = ids.map(id=>players.find(p=>p.id===id)).filter(Boolean);
+  const getAvg = (pid,n) => {
+    const st=statsCache[pid]; if(!st) return null;
+    const yrs=Object.keys(st).map(Number).sort((a,b)=>b-a).slice(0,n);
+    if(!yrs.length) return null;
+    return (yrs.reduce((s,yr)=>s+(st[yr]?.fpts||0),0)/yrs.length).toFixed(1);
+  };
+  const allYrs = [...new Set(pls.flatMap(p=>Object.keys(statsCache[p.id]||{}).map(Number)))].sort((a,b)=>a-b);
+  const chartData = allYrs.map(yr=>{
+    const row={year:yr};
+    pls.forEach(p=>{ row[p.nm]=statsCache[p.id]?.[yr]?.fpts||null; });
+    return row;
+  });
+  // Radar data for projection scores
+  const radarData = ["volume","efficiency","trend","matchup"].map(key=>{
+    const row = {metric: key.charAt(0).toUpperCase()+key.slice(1)};
+    pls.forEach(p=>{ row[p.nm] = p[key] ?? 5; });
+    return row;
+  });
+
+  return <div style={{position:'fixed',bottom:0,left:0,right:0,zIndex:100,background:'rgba(4,6,12,.97)',borderTop:'2px solid var(--em)',maxHeight:'65vh',overflowY:'auto',boxShadow:'0 -20px 60px rgba(0,0,0,.8)'}}>
+    <div style={{maxWidth:1400,margin:'0 auto',padding:'16px 20px'}}>
+      <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:14}}>
+        <div style={{fontFamily:"'Bebas Neue'",fontSize:22,letterSpacing:1.5}}>PLAYER COMPARISON <span style={{fontSize:13,color:'var(--dm)',fontFamily:"'Barlow'",fontWeight:400,marginLeft:12,letterSpacing:0}}>{pls.length} players</span></div>
+        <button onClick={onClose} style={{width:30,height:30,borderRadius:'50%',border:'1px solid var(--bd)',background:'rgba(255,255,255,.06)',color:'var(--dm)',cursor:'pointer',fontSize:16,display:'flex',alignItems:'center',justifyContent:'center'}}>x</button>
+      </div>
+      {/* Side-by-side stat cards */}
+      <div style={{display:'grid',gridTemplateColumns:`repeat(${pls.length},1fr)`,gap:10,marginBottom:16}}>
+        {pls.map((p,i)=>{
+          const st=statsCache[p.id]; const yrs=st?Object.keys(st).map(Number).sort((a,b)=>b-a):[];
+          const last=yrs[0]?st[yrs[0]]:null;
+          return <div key={p.id} style={{background:'var(--s1)',border:`2px solid ${COMPARE_COLORS[i]}33`,borderTop:`3px solid ${COMPARE_COLORS[i]}`,borderRadius:12,padding:14}}>
+            <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:10}}>
+              <Hs src={p.hs} sz={40}/>
+              <div><div style={{fontWeight:800,fontSize:14,cursor:'pointer'}} onClick={()=>goP(p.id)}>{p.nm}</div>
+              <div style={{display:'flex',gap:5,alignItems:'center'}}><Pil ch={p.pos} c={posColor(p.pos)} s={{padding:'1px 6px',fontSize:10}}/><span style={{color:'var(--dm)',fontSize:11}}>{p.tm}</span></div></div>
+            </div>
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:6}}>
+              {[{l:"Career Avg",v:getAvg(p.id,9),c:COMPARE_COLORS[i]},{l:"Last 3 Avg",v:getAvg(p.id,3),c:COMPARE_COLORS[i]},{l:"Last 5 Avg",v:getAvg(p.id,5),c:COMPARE_COLORS[i]},{l:"Best Season",v:yrs.length?Math.max(...yrs.map(yr=>st[yr]?.fpts||0)):"—",c:"var(--gd)"}].map(({l,v,c})=>
+                <div key={l} style={{background:'rgba(0,0,0,.25)',borderRadius:8,padding:'7px 9px'}}>
+                  <div style={{fontSize:10,color:'var(--dm)',textTransform:'uppercase',letterSpacing:.5}}>{l}</div>
+                  <div style={{fontFamily:"'Bebas Neue'",fontSize:22,color:c,lineHeight:1}}>{v??"—"}</div>
+                </div>
+              )}
+            </div>
+            {last && <div style={{marginTop:8,paddingTop:8,borderTop:'1px solid var(--bd)'}}>
+              <div style={{display:'flex',gap:4,flexWrap:'wrap'}}>
+                {p.pos==='QB'&&<><Pil ch={`${(last.passYd||0).toLocaleString()} yds`} c="var(--em)" s={{fontSize:9,padding:'1px 5px'}}/><Pil ch={`${last.passTD||0} TD`} c="var(--lm)" s={{fontSize:9,padding:'1px 5px'}}/></>}
+                {p.pos==='RB'&&<><Pil ch={`${(last.rushYd||0).toLocaleString()} rush`} c="var(--em)" s={{fontSize:9,padding:'1px 5px'}}/><Pil ch={`${last.rec||0} rec`} c="var(--sk)" s={{fontSize:9,padding:'1px 5px'}}/></>}
+                {(p.pos==='WR'||p.pos==='TE')&&<><Pil ch={`${last.rec||0}/${last.tgt||"?"}`} c="var(--em)" s={{fontSize:9,padding:'1px 5px'}}/><Pil ch={`${(last.recYd||0).toLocaleString()} yds`} c="var(--sk)" s={{fontSize:9,padding:'1px 5px'}}/></>}
+                <Pil ch={`${last.fpts||0} PPR`} c="var(--gd)" s={{fontSize:9,padding:'1px 5px',fontWeight:800}}/>
+              </div>
+            </div>}
+          </div>;
+        })}
+      </div>
+      {/* Charts row */}
+      <div style={{display:'grid',gridTemplateColumns:'2fr 1fr',gap:12}}>
+        {chartData.length>0 && <div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:12,padding:14}}>
+          <div style={{fontFamily:"'Bebas Neue'",fontSize:16,letterSpacing:1,marginBottom:10}}>FANTASY POINTS TREND</div>
+          <ResponsiveContainer width="100%" height={180}><LineChart data={chartData}><CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,.04)"/><XAxis dataKey="year" tick={{fontSize:12}}/><YAxis tick={{fontSize:12}}/><Tooltip content={<TT/>}/><Legend iconSize={10}/>
+            {pls.map((p,i)=><Line key={p.id} type="monotone" dataKey={p.nm} stroke={COMPARE_COLORS[i]} strokeWidth={2.5} dot={{fill:COMPARE_COLORS[i],r:4}} connectNulls={false}/>)}
+          </LineChart></ResponsiveContainer>
+        </div>}
+        {/* Radar chart */}
+        <div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:12,padding:14}}>
+          <div style={{fontFamily:"'Bebas Neue'",fontSize:16,letterSpacing:1,marginBottom:10}}>SKILL PROFILE</div>
+          <ResponsiveContainer width="100%" height={180}><RadarChart data={radarData}><PolarGrid stroke="rgba(255,255,255,.08)"/><PolarAngleAxis dataKey="metric" tick={{fontSize:11,fill:'var(--dm)'}}/><PolarRadiusAxis domain={[0,10]} tick={false} axisLine={false}/>
+            {pls.map((p,i)=><Radar key={p.id} name={p.nm} dataKey={p.nm} stroke={COMPARE_COLORS[i]} fill={COMPARE_COLORS[i]} fillOpacity={0.12} strokeWidth={2}/>)}
+          </RadarChart></ResponsiveContainer>
         </div>
       </div>
-      <div style={{display:'flex',gap:3,flexWrap:'wrap'}}>{TABS.map(t=><button key={t} onClick={()=>go(t)} style={{padding:'7px 16px',borderRadius:8,border:'none',background:tab===t?'var(--em)':'transparent',color:tab===t?'#000':'var(--tx)',fontWeight:tab===t?800:500,fontSize:14,cursor:'pointer',fontFamily:"'Barlow'"}}>{t}</button>)}</div>
     </div>
-  </div>
-);
+  </div>;
+};
+
+// ═══════════════════════════════════════════════════════════════
+//  NAV
+// ═══════════════════════════════════════════════════════════════
+// Nav and TABS are now in src/components/Nav.jsx — using NavBar import above
 
 // ═══════════════════════════════════════════════════════════════
 //  HOME
 // ═══════════════════════════════════════════════════════════════
-const Home = ({go,goT,players,loading}) => (
-  <div className="fu" style={{maxWidth:1400,margin:'0 auto',padding:'24px 20px'}}>
-    <div style={{borderRadius:22,padding:'48px 40px',marginBottom:24,background:'linear-gradient(135deg,rgba(249,115,22,.1),rgba(56,189,248,.06),rgba(4,6,12,.95))',border:'1px solid rgba(249,115,22,.12)'}}>
-      <Pil ch="LIVE ESPN API • ALL ACTIVE PLAYERS • 2017-2025" c="var(--gd)" s={{marginBottom:16,display:'inline-flex'}}/>
-      <h1 style={{fontFamily:"'Bebas Neue'",fontSize:54,lineHeight:1,letterSpacing:2,marginBottom:10}}>NFL Fantasy Football<br/><span style={{color:'var(--em)'}}>Intelligence Hub</span></h1>
-      <p style={{color:'var(--dm)',fontSize:17,maxWidth:640,lineHeight:1.6,marginBottom:24}}>Dynamically pulling every active QB, RB, WR, and TE from all 32 NFL rosters via the ESPN Public API. Click any player to fetch their full career stats with interactive charts.</p>
-      <div style={{display:'flex',gap:10,flexWrap:'wrap'}}>
-        {TABS.slice(1).map((t,i)=><button key={t} onClick={()=>go(t)} style={{padding:'12px 26px',borderRadius:11,border:i===0?'none':'1px solid var(--bd)',background:i===0?'linear-gradient(135deg,var(--em),var(--gd))':'rgba(255,255,255,.04)',color:i===0?'#000':'var(--tx)',fontWeight:800,fontSize:15,cursor:'pointer'}}>{t}</button>)}
+const HomeLegacy = ({go,goT,players,loading}) => (
+  <div className="fu page-wrap">
+    <div className="hero-section">
+      <div className="hero-eyebrow">LIVE ESPN API • ALL ACTIVE PLAYERS • 2017–2025</div>
+      <h1 className="hero-title">NFL Fantasy Football<br/><span style={{color:'var(--em)'}}>Intelligence Hub</span></h1>
+      <p className="hero-subtitle">Dynamically pulling every active QB, RB, WR, and TE from all 32 NFL rosters via the ESPN Public API. Click any player to fetch their full career stats with interactive charts.</p>
+      <div className="hero-cta-row">
+        {NAV_TABS.slice(1).map((t,i)=><button key={t} onClick={()=>go(t)} className={i===0?"btn-primary":"btn-ghost"}>{t}</button>)}
       </div>
     </div>
     <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:12,marginBottom:24}}>
@@ -430,18 +587,19 @@ const Home = ({go,goT,players,loading}) => (
       <StCard l="RBs + WRs" v={loading?"...":(players.filter(p=>p.pos==="RB").length+"+"+players.filter(p=>p.pos==="WR").length)} c="var(--sk)"/>
       <StCard l="TEs" v={loading?"...":players.filter(p=>p.pos==="TE").length} c="var(--vi)"/>
     </div>
-    <h2 style={{fontFamily:"'Bebas Neue'",fontSize:22,letterSpacing:1,marginBottom:12}}>ALL 32 TEAMS</h2>
+    <h2 className="section-heading">ALL 32 TEAMS</h2>
     <div style={{display:'grid',gridTemplateColumns:'repeat(8,1fr)',gap:10,marginBottom:24}}>
-      {ALL_AB.map(ab=><div key={ab} onClick={()=>goT(ab)} style={{display:'flex',flexDirection:'column',alignItems:'center',gap:5,padding:'12px 6px',borderRadius:14,border:'1px solid var(--bd)',background:'var(--s1)',cursor:'pointer',transition:'all .2s'}} onMouseEnter={e=>{e.currentTarget.style.borderColor=TM[ab].c1;e.currentTarget.style.transform='translateY(-2px)'}} onMouseLeave={e=>{e.currentTarget.style.borderColor='var(--bd)';e.currentTarget.style.transform='none'}}><Logo ab={ab} sz={36}/><span style={{fontSize:11,color:'var(--dm)',fontWeight:600}}>{ab}</span></div>)}
+      {ALL_AB.map(ab=><div key={ab} className="team-card" onClick={()=>goT(ab)} onMouseEnter={e=>{e.currentTarget.style.borderColor=TM[ab].c1;}} onMouseLeave={e=>{e.currentTarget.style.borderColor='var(--bd)';}}><Logo ab={ab} sz={36}/><span>{ab}</span></div>)}
     </div>
     {loading && <Spinner msg="Fetching all 32 team rosters from ESPN..."/>}
   </div>
 );
 
 // ═══════════════════════════════════════════════════════════════
-//  PLAYERS PAGE — Dynamic ESPN fetch
+//  PLAYERS PAGE — moved to src/pages/Players.jsx
+//  This stub is kept to avoid breaking the reference below
 // ═══════════════════════════════════════════════════════════════
-const Players = ({players,loading,sel,setSel,goT,statsCache,setStatsCache}) => {
+const Players_LEGACY = ({players,loading,sel,setSel,goT,statsCache,setStatsCache}) => {
   const[pos,setPos]=useState("ALL");const[q,setQ]=useState("");const[yr,setYr]=useState(null);const[fetching,setFetching]=useState(false);
   const[gameLog,setGameLog]=useState([]);const[fetchingLog,setFetchingLog]=useState(false);
   const list = useMemo(()=>{let l=players;if(pos!=="ALL")l=l.filter(p=>p.pos===pos);if(q)l=l.filter(p=>p.nm.toLowerCase().includes(q.toLowerCase())||p.tm.toLowerCase().includes(q.toLowerCase()));return l},[players,pos,q]);
@@ -692,17 +850,10 @@ const Teams = ({sel,setSel,players,goP,statsCache}) => {
   const afcT = new Set(ALL_AB.filter(ab=>TM[ab].conf==="AFC"));
   const filt = conf==="ALL"?ALL_AB:ALL_AB.filter(ab=>conf==="AFC"?afcT.has(ab):!afcT.has(ab));
 
-  // Fetch real depth chart when team changes
+  // Load depth chart from static snapshot
   useEffect(()=>{
     if(!sel) return;
-    const tid = AB_TO_TID[sel];
-    if(!tid) return;
-    setLoadingDepth(true);
-    setDepthChart({});
-    fetchTeamDepthChart(tid).then(chart=>{
-      setDepthChart(chart||{});
-      setLoadingDepth(false);
-    }).catch(()=>setLoadingDepth(false));
+    setDepthChart(STATIC_DEPTH_CHARTS[sel] || {});
   },[sel]);
 
   // Sort a position group:
@@ -1081,76 +1232,17 @@ const Predictions = ({goT, players, statsCache, setStatsCache}) => {
   const [progress,    setProgress]   = useState(0);
   const [showCheat,   setShowCheat]  = useState(false);
 
-  // Fetch real 2024 + 2025 standings from ESPN on mount
+  // Load standings from static snapshot
   useEffect(() => {
-    const parse = (d) => {
-      if (!d) return {};
-      const map = {};
-      const extract = (entries) => {
-        for (const e of (entries||[])) {
-          const ab  = e.team?.abbreviation;
-          const stats = e.stats || [];
-          const wStat = stats.find(s => s.name === "wins" || s.abbreviation === "W");
-          const lStat = stats.find(s => s.name === "losses" || s.abbreviation === "L");
-          if (ab && wStat) map[ab] = { wins: +wStat.value || 0, losses: +(lStat?.value||0) };
-        }
-      };
-      if (d?.standings?.entries) extract(d.standings.entries);
-      if (d?.children) for (const ch of d.children) {
-        if (ch.standings?.entries) extract(ch.standings.entries);
-        if (ch.children) for (const cc of ch.children) extract(cc.standings?.entries || []);
-      }
-      return map;
-    };
-    Promise.all([
-      espn(`${SITE}/standings?season=2024`),
-      espn(`${SITE}/standings?season=2025`),
-    ]).then(([d24, d25]) => {
-      setStandings24(parse(d24));
-      setStandings25(parse(d25));
-    });
+    setStandings24(STATIC_STANDINGS_24);
+    setStandings25(STATIC_STANDINGS_25);
   }, []);
 
-  // Auto-fetch stats for QB+top RB+top WR of every team
+  // Stats are pre-loaded from static snapshot — mark done immediately
   useEffect(() => {
-    if (fetchDone || players.length === 0) return;
-    setFetching(true);
-    const keyPlayers = [];
-    for (const ab of ALL_AB) {
-      const roster = players.filter(p => p.tm === ab);
-      const qb = roster.filter(p => p.pos === "QB")[0];
-      const wrs = roster.filter(p => p.pos === "WR").slice(0, 2);
-      const rb  = roster.filter(p => p.pos === "RB")[0];
-      const te  = roster.filter(p => p.pos === "TE")[0];
-      for (const p of [qb, ...wrs, rb, te]) {
-        if (p && !statsCache[p.id]) keyPlayers.push(p);
-      }
-    }
-    let done = 0;
-    const total = keyPlayers.length;
-    if (total === 0) { setFetching(false); setFetchDone(true); return; }
-
-    const runBatch = async (batch) => {
-      await Promise.allSettled(batch.map(p =>
-        fetchPlayerStats(p.id).then(data => {
-          setStatsCache(prev => ({...prev, [p.id]: data || {}}));
-          done++;
-          setProgress(Math.round((done / total) * 100));
-        }).catch(() => {
-          done++;
-          setProgress(Math.round((done / total) * 100));
-        })
-      ));
-    };
-
-    (async () => {
-      for (let i = 0; i < keyPlayers.length; i += 8) {
-        await runBatch(keyPlayers.slice(i, i + 8));
-      }
-      setFetching(false);
+    if (!fetchDone && players.length > 0) {
       setFetchDone(true);
-    })();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    }
   }, [players, fetchDone]);
 
   const preds  = useMemo(() => calcPreds(players, statsCache, standings24, standings25), [players, statsCache, standings24, standings25]);
@@ -1364,331 +1456,12 @@ const Predictions = ({goT, players, statsCache, setStatsCache}) => {
   </div>;
 };
 
-// ═══════════════════════════════════════════════════════════════
-//  RANKINGS — Opportunity-first fantasy projection system
-// ═══════════════════════════════════════════════════════════════
-const SCORE_COLORS = { volume:'var(--em)', efficiency:'var(--sk)', trend:'var(--lm)', matchup:'var(--vi)' };
+// Rankings is now unified into src/pages/Players.jsx
+// This empty object prevents any accidental reference errors
+const SCORE_COLORS = { volume:"var(--em)", efficiency:"var(--sk)", trend:"var(--lm)", matchup:"var(--vi)" };
 
-const Rankings = ({players, statsCache, setStatsCache, goT, goP}) => {
-  const [q,         setQ]         = useState("");
-  const [posFilter, setPosFilter] = useState("ALL");
-  const [sortKey,   setSortKey]   = useState("projection");
-  const [expanded,  setExpanded]  = useState(null);
-  const [fetching,  setFetching]  = useState(false);
-  const [fetchDone, setFetchDone] = useState(false);
-  const [progress,  setProgress]  = useState(0);
+// Rankings merged into src/pages/Players.jsx
 
-  // Auto-fetch stats for every offensive player in batches of 8
-  useEffect(() => {
-    if (fetchDone || players.length === 0) return;
-    const needed = players.filter(p => !statsCache[p.id]);
-    if (!needed.length) { setFetchDone(true); return; }
-    setFetching(true);
-    let done = 0;
-    const total = needed.length;
-    (async () => {
-      for (let i = 0; i < needed.length; i += 8) {
-        await Promise.allSettled(needed.slice(i, i + 8).map(p =>
-          fetchPlayerStats(p.id).then(data => {
-            setStatsCache(prev => ({...prev, [p.id]: data || {}}));
-            done++;
-            setProgress(Math.round((done / total) * 100));
-          }).catch(() => { done++; setProgress(Math.round((done / total) * 100)); })
-        ));
-      }
-      setFetching(false);
-      setFetchDone(true);
-    })();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [players, fetchDone]);
-
-  const ranked = useMemo(() => rankPlayers(players, statsCache), [players, statsCache]);
-
-  const displayed = useMemo(() => {
-    let list = posFilter === "ALL" ? ranked : ranked.filter(p => p.pos === posFilter);
-    if (q) {
-      const lq = q.toLowerCase();
-      list = list.filter(p => p.nm.toLowerCase().includes(lq) || p.tm.toLowerCase().includes(lq));
-    }
-    const fns = {
-      projection: (a,b) => b.projection - a.projection,
-      volume:     (a,b) => b.volume - a.volume,
-      efficiency: (a,b) => b.efficiency - a.efficiency,
-      trend:      (a,b) => b.trend - a.trend,
-      matchup:    (a,b) => b.matchup - a.matchup,
-    };
-    return [...list].sort(fns[sortKey] || fns.projection);
-  }, [ranked, posFilter, q, sortKey]);
-
-  const MiniBar = ({val, color}) => (
-    <div style={{display:'flex', alignItems:'center', gap:5}}>
-      <div style={{flex:1, height:5, background:'rgba(255,255,255,.07)', borderRadius:99, overflow:'hidden'}}>
-        <div style={{width:`${(val/10)*100}%`, height:'100%', background:color, borderRadius:99, transition:'width .4s'}}/>
-      </div>
-      <span style={{fontSize:11, color:'var(--dm)', minWidth:28, textAlign:'right', fontFamily:"'Bebas Neue'", letterSpacing:.5}}>{val}</span>
-    </div>
-  );
-
-  const projColor = v => v >= 7 ? 'var(--lm)' : v >= 5 ? 'var(--gd)' : v >= 3 ? 'var(--em)' : 'var(--rs)';
-
-  return <div className="fu" style={{maxWidth:1400, margin:'0 auto', padding:'24px 20px'}}>
-
-    {/* ── Header ── */}
-    <div style={{background:'var(--s1)', border:'1px solid var(--bd)', borderRadius:14, padding:18, marginBottom:16}}>
-      <div style={{display:'flex', alignItems:'flex-start', justifyContent:'space-between', flexWrap:'wrap', gap:12, marginBottom:12}}>
-        <div>
-          <h2 style={{fontFamily:"'Bebas Neue'", fontSize:28, letterSpacing:1.5, marginBottom:4}}>
-            OPPORTUNITY-FIRST RANKINGS
-          </h2>
-          <p style={{color:'var(--dm)', fontSize:13, lineHeight:1.7}}>
-            <span style={{color:'var(--em)',  fontWeight:700}}>40% Volume</span> ·{' '}
-            <span style={{color:'var(--sk)',  fontWeight:700}}>25% Efficiency</span> ·{' '}
-            <span style={{color:'var(--lm)', fontWeight:700}}>20% Trend</span> ·{' '}
-            <span style={{color:'var(--vi)', fontWeight:700}}>15% Matchup</span>
-            <span style={{color:'var(--dm)', fontSize:11}}> · click any row to see the breakdown</span>
-          </p>
-        </div>
-        {/* Position filter */}
-        <div style={{display:'flex', gap:4}}>
-          {["ALL","QB","RB","WR","TE"].map(p => (
-            <button key={p} onClick={() => setPosFilter(p)} style={{
-              padding:'6px 13px', borderRadius:7, border:'none', cursor:'pointer', fontSize:12, fontWeight:600,
-              background: posFilter===p ? (p==="ALL"?'var(--em)':posColor(p)) : 'rgba(255,255,255,.05)',
-              color: posFilter===p ? '#000' : 'var(--dm)',
-            }}>{p}</button>
-          ))}
-        </div>
-      </div>
-
-      {/* Search + sort row */}
-      <div style={{display:'flex', gap:8, flexWrap:'wrap', alignItems:'center'}}>
-        <input value={q} onChange={e=>setQ(e.target.value)} placeholder="Search player or team…"
-          style={{flex:1, minWidth:180, padding:'9px 13px', borderRadius:9, border:'1px solid var(--bd)',
-                  background:'rgba(0,0,0,.3)', color:'var(--tx)', outline:'none', fontSize:13}}/>
-        <div style={{display:'flex', gap:4, flexWrap:'wrap'}}>
-          {[['projection','Overall'],['volume','Volume'],['efficiency','Efficiency'],['trend','Trend'],['matchup','Matchup']].map(([k,l]) => (
-            <button key={k} onClick={() => setSortKey(k)} style={{
-              padding:'5px 12px', borderRadius:7, border:'none', cursor:'pointer', fontSize:12, whiteSpace:'nowrap',
-              background: sortKey===k ? 'var(--em)' : 'rgba(255,255,255,.05)',
-              color: sortKey===k ? '#000' : 'var(--dm)', fontWeight: sortKey===k ? 800 : 500,
-            }}>{l}</button>
-          ))}
-        </div>
-      </div>
-
-      {/* Progress bar */}
-      {fetching && (
-        <div style={{marginTop:12}}>
-          <div style={{display:'flex', justifyContent:'space-between', fontSize:12, color:'var(--dm)', marginBottom:4}}>
-            <span>Fetching player stats for projections… ({displayed.filter(p=>p.hasData).length} ready)</span>
-            <span>{progress}%</span>
-          </div>
-          <div style={{height:4, background:'rgba(255,255,255,.06)', borderRadius:99, overflow:'hidden'}}>
-            <div style={{width:`${progress}%`, height:'100%', background:'linear-gradient(90deg,var(--em),var(--gd))', borderRadius:99, transition:'width .3s'}}/>
-          </div>
-        </div>
-      )}
-    </div>
-
-    {/* ── Stat summary cards ── */}
-    <div style={{display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:10, marginBottom:14}}>
-      {[
-        {l:"Players Ranked", v:displayed.length,                           c:"var(--em)"},
-        {l:"With Stat Data",  v:displayed.filter(p=>p.hasData).length,    c:"var(--lm)"},
-        {l:"Top Projection",  v:displayed[0]?.projection ?? "—",          c:"var(--gd)"},
-        {l:"Avg Projection",  v:displayed.length ? (displayed.reduce((s,p)=>s+p.projection,0)/displayed.length).toFixed(1) : "—", c:"var(--sk)"},
-      ].map(({l,v,c}) => <StCard key={l} l={l} v={v} c={c}/>)}
-    </div>
-
-    {/* ── Main table ── */}
-    <div style={{background:'var(--s1)', border:'1px solid var(--bd)', borderRadius:14, overflow:'hidden'}}>
-      <div style={{overflowX:'auto'}}>
-        <table style={{width:'100%', borderCollapse:'collapse'}}>
-          <thead>
-            <tr style={{borderBottom:'2px solid var(--bd)', background:'rgba(0,0,0,.25)'}}>
-              <th style={{...th, width:36}}>#</th>
-              <th style={th}>Player</th>
-              <th style={{...th, width:46}}>Pos</th>
-              <th style={{...th, width:60}}>Team</th>
-              <th style={{...th, width:130}}>Projection</th>
-              <th style={{...th, width:115, color:'var(--em)'}}>Volume <span style={{fontSize:9, fontWeight:400}}>(40%)</span></th>
-              <th style={{...th, width:115, color:'var(--sk)'}}>Efficiency <span style={{fontSize:9, fontWeight:400}}>(25%)</span></th>
-              <th style={{...th, width:115, color:'var(--lm)'}}>Trend <span style={{fontSize:9, fontWeight:400}}>(20%)</span></th>
-              <th style={{...th, width:115, color:'var(--vi)'}}>Matchup <span style={{fontSize:9, fontWeight:400}}>(15%)</span></th>
-              <th style={{...th, width:36}}/>
-            </tr>
-          </thead>
-          <tbody>
-            {displayed.flatMap((p, i) => {
-              const isOpen = expanded === p.id;
-              const pc = posColor(p.pos);
-              const rows = [];
-
-              // Main row
-              rows.push(
-                <tr key={p.id}
-                  style={{borderBottom: isOpen ? 'none' : '1px solid var(--bd)', cursor:'pointer', transition:'background .1s'}}
-                  onMouseEnter={e => e.currentTarget.style.background='rgba(255,255,255,.025)'}
-                  onMouseLeave={e => e.currentTarget.style.background='transparent'}
-                  onClick={() => setExpanded(isOpen ? null : p.id)}>
-
-                  <td style={{...td, color:'var(--dm)', fontWeight:700, fontSize:12}}>{i+1}</td>
-
-                  {/* Player */}
-                  <td style={td}>
-                    <div style={{display:'flex', alignItems:'center', gap:10}}>
-                      <img src={p.hs} alt={p.nm} width={40} height={40} className="hs"
-                        onClick={e=>{e.stopPropagation();goP(p.id)}}
-                        onError={e=>{e.target.style.opacity='.2'}}/>
-                      <div>
-                        <div style={{fontWeight:800, fontSize:14, cursor:'pointer'}}
-                          onClick={e=>{e.stopPropagation();goP(p.id)}}>{p.nm}</div>
-                        {!p.hasData && <span style={{fontSize:10, color:'var(--rs)', fontStyle:'italic'}}>loading…</span>}
-                      </div>
-                    </div>
-                  </td>
-
-                  <td style={td}><Pil ch={p.pos} c={pc} s={{padding:'2px 7px', fontSize:10}}/></td>
-
-                  {/* Team logo */}
-                  <td style={td}>
-                    <div style={{display:'flex', alignItems:'center', gap:5, cursor:'pointer'}}
-                      onClick={e=>{e.stopPropagation();goT(p.tm)}}>
-                      <Logo ab={p.tm} sz={22}/>
-                      <span style={{fontSize:12, color:'var(--dm)'}}>{p.tm}</span>
-                    </div>
-                  </td>
-
-                  {/* Overall projection */}
-                  <td style={td}>
-                    <div style={{display:'flex', alignItems:'center', gap:8}}>
-                      <span style={{fontFamily:"'Bebas Neue'", fontSize:24, color:projColor(p.projection), minWidth:38, lineHeight:1}}>
-                        {p.projection}
-                      </span>
-                      <div style={{flex:1, height:7, background:'rgba(255,255,255,.06)', borderRadius:99, overflow:'hidden'}}>
-                        <div style={{width:`${(p.projection/10)*100}%`, height:'100%', background:projColor(p.projection), borderRadius:99}}/>
-                      </div>
-                    </div>
-                  </td>
-
-                  {/* Component score bars */}
-                  <td style={td}><MiniBar val={p.volume}     color="var(--em)"/></td>
-                  <td style={td}><MiniBar val={p.efficiency} color="var(--sk)"/></td>
-                  <td style={td}><MiniBar val={p.trend}      color="var(--lm)"/></td>
-                  <td style={td}><MiniBar val={p.matchup}    color="var(--vi)"/></td>
-
-                  {/* Expand toggle */}
-                  <td style={{...td, textAlign:'center', color:'var(--dm)', fontSize:12, userSelect:'none'}}>
-                    {isOpen ? '▲' : '▼'}
-                  </td>
-                </tr>
-              );
-
-              // Expandable "Why this rank?" row
-              if (isOpen) {
-                const rs = p.recentStats;
-                const perGame = (val, div) => div > 0 ? (val / div).toFixed(1) : "—";
-                const gp = rs?.gp || 1;
-                rows.push(
-                  <tr key={`${p.id}_exp`} style={{borderBottom:'1px solid var(--bd)'}}>
-                    <td colSpan={10} style={{padding:'14px 18px', background:'rgba(0,0,0,.18)'}}>
-                      <div style={{fontFamily:"'Bebas Neue'", fontSize:13, letterSpacing:1.5, color:'var(--em)', marginBottom:12}}>
-                        WHY THIS RANK? — {p.nm}
-                      </div>
-                      <div style={{display:'grid', gridTemplateColumns:'repeat(auto-fill,minmax(210px,1fr))', gap:10, marginBottom:12}}>
-                        {[
-                          {
-                            key: 'volume', label:'VOLUME (40%)', color:'var(--em)', score: p.volume,
-                            detail: rs ? (
-                              p.pos==="QB"  ? `${perGame(rs.passAtt||0, gp)} att/g (elite = 38)`  :
-                              p.pos==="RB"  ? `${perGame((rs.rushAtt||0)+(rs.rec||0), gp)} tch/g (elite = 22)` :
-                              `${perGame(rs.tgt||0, gp)} tgt/g (elite = ${p.pos==="TE"?"7":"10"})`
-                            ) : "No recent stats — score estimated",
-                          },
-                          {
-                            key: 'efficiency', label:'EFFICIENCY (25%)', color:'var(--sk)', score: p.efficiency,
-                            detail: rs ? (
-                              p.pos==="QB"  ? `${perGame(rs.passYd||0, Math.max(rs.passAtt||1,1))} yds/att · ${rs.passTD||0} TD · ${rs.passInt||0} INT` :
-                              p.pos==="RB"  ? `${perGame(rs.rushYd||0, Math.max(rs.rushAtt||1,1))} yds/carry · ${rs.rec||0} rec` :
-                              `${perGame(rs.recYd||0, Math.max(rs.tgt||rs.rec||1,1))} yds/tgt · ${rs.recTD||0} TD`
-                            ) : "No recent stats",
-                          },
-                          {
-                            key: 'trend', label:'TREND (20%)', color:'var(--lm)', score: p.trend,
-                            detail: p.recentYear
-                              ? `Based on ${p.recentYear} vs prior season — ${p.trend >= 6 ? "improving ↑" : p.trend >= 5 ? "stable →" : "declining ↓"}`
-                              : "Insufficient history",
-                          },
-                          {
-                            key: 'matchup', label:'MATCHUP (15%)', color:'var(--vi)', score: p.matchup,
-                            detail: "League-average placeholder (5.0). Upgrade MATCHUP_MAP in projectionEngine.js with weekly opponent data.",
-                          },
-                        ].map(item => (
-                          <div key={item.key} style={{background:'rgba(255,255,255,.03)', border:`1px solid ${item.color}22`, borderRadius:10, padding:'10px 13px'}}>
-                            <div style={{fontSize:10, color:item.color, fontWeight:700, fontFamily:"'Barlow Condensed'", letterSpacing:.8, marginBottom:3}}>{item.label}</div>
-                            <div style={{fontFamily:"'Bebas Neue'", fontSize:28, color:item.color, lineHeight:1, marginBottom:4}}>{item.score}</div>
-                            <div style={{fontSize:12, color:'var(--dm)', lineHeight:1.4}}>{item.detail}</div>
-                          </div>
-                        ))}
-                      </div>
-
-                      {/* Formula line */}
-                      <div style={{fontSize:12, color:'var(--dm)', fontFamily:"'Barlow Condensed'", letterSpacing:.3}}>
-                        <span style={{color:'var(--tx)', fontWeight:600}}>Projection = </span>
-                        <span style={{color:'var(--em)'}}>{p.volume}×0.40</span> +{' '}
-                        <span style={{color:'var(--sk)'}}>{p.efficiency}×0.25</span> +{' '}
-                        <span style={{color:'var(--lm)'}}>{p.trend}×0.20</span> +{' '}
-                        <span style={{color:'var(--vi)'}}>{p.matchup}×0.15</span>
-                        <span style={{color:'var(--gd)', fontWeight:700, fontSize:14, marginLeft:8}}> = {p.projection}</span>
-                      </div>
-
-                      {/* Stat pills */}
-                      {rs && (
-                        <div style={{display:'flex', gap:6, flexWrap:'wrap', marginTop:10}}>
-                          <Pil ch={`${rs.gp || "?"} GP`} c="var(--tx)" s={{fontSize:11}}/>
-                          {p.pos==="QB" && <>
-                            <Pil ch={`${(rs.passYd||0).toLocaleString()} pass yds`} c="var(--em)" s={{fontSize:11}}/>
-                            <Pil ch={`${rs.passTD||0} TD`}  c="var(--lm)" s={{fontSize:11}}/>
-                            <Pil ch={`${rs.passInt||0} INT`} c="var(--rs)" s={{fontSize:11}}/>
-                            <Pil ch={`${(rs.rushYd||0).toLocaleString()} rush yds`} c="var(--sk)" s={{fontSize:11}}/>
-                          </>}
-                          {p.pos==="RB" && <>
-                            <Pil ch={`${(rs.rushYd||0).toLocaleString()} rush yds`} c="var(--em)" s={{fontSize:11}}/>
-                            <Pil ch={`${rs.rushTD||0} rush TD`} c="var(--lm)" s={{fontSize:11}}/>
-                            <Pil ch={`${rs.rec||0} rec / ${rs.tgt||"?"} tgt`} c="var(--sk)" s={{fontSize:11}}/>
-                            <Pil ch={`${(rs.recYd||0).toLocaleString()} rec yds`} c="var(--vi)" s={{fontSize:11}}/>
-                          </>}
-                          {(p.pos==="WR"||p.pos==="TE") && <>
-                            <Pil ch={`${rs.tgt||"?"} tgt`}    c="var(--em)" s={{fontSize:11}}/>
-                            <Pil ch={`${rs.rec||0} rec`}       c="var(--sk)" s={{fontSize:11}}/>
-                            <Pil ch={`${(rs.recYd||0).toLocaleString()} yds`} c="var(--lm)" s={{fontSize:11}}/>
-                            <Pil ch={`${rs.recTD||0} TD`}      c="var(--gd)" s={{fontSize:11}}/>
-                          </>}
-                          <Pil ch={`${rs.fpts||0} FPTS`} c="var(--gd)" s={{fontSize:11, fontWeight:800}}/>
-                        </div>
-                      )}
-                    </td>
-                  </tr>
-                );
-              }
-
-              return rows;
-            })}
-          </tbody>
-        </table>
-      </div>
-      {displayed.length === 0 && (
-        <div style={{padding:40, textAlign:'center', color:'var(--dm)'}}>
-          {fetching ? "Loading player stats…" : "No players match your search."}
-        </div>
-      )}
-    </div>
-
-    <div style={{marginTop:12, color:'var(--dm)', fontSize:12, padding:'0 4px', lineHeight:1.7}}>
-      * Volume = opportunity per game · Efficiency = fantasy pts per touch/target · Trend = YoY improvement detector · Matchup = opponent vulnerability (placeholder) · Click any row to see the full formula breakdown.
-    </div>
-  </div>;
-};
 
 // ═══════════════════════════════════════════════════════════════
 //  APP — Main Component
@@ -1699,15 +1472,13 @@ export default function App() {
   const[loading,setLoading]=useState(true);
   const[selP,setSelP]=useState(null);
   const[selT,setSelT]=useState(null);
-  const[statsCache,setStatsCache]=useState({});
+  const[statsCache,setStatsCache]=useState(STATIC_PLAYER_STATS);
   const[tabHistory,setTabHistory]=useState([]);
 
-  // Fetch all rosters on mount
+  // Load rosters from static snapshot (re-run scripts/fetchStaticData.mjs to refresh)
   useEffect(()=>{
-    fetchAllRosters().then(pl=>{
-      setPlayers(pl);
-      setLoading(false);
-    }).catch(()=>setLoading(false));
+    setPlayers(STATIC_ROSTERS);
+    setLoading(false);
   },[]);
 
   // Navigation helpers — push current tab to history before switching
@@ -1722,17 +1493,20 @@ export default function App() {
     window.scrollTo(0,0);
   };
 
-  return <div><style>{CSS}</style>
-    <Nav tab={tab} go={go} goBack={goBack} canGoBack={tabHistory.length>0}/>
-    {tab==="Home"&&<Home go={go} goT={goT} players={players} loading={loading}/>}
-    {tab==="Players"&&<Players players={players} loading={loading} sel={selP} setSel={setSelP} goT={goT} statsCache={statsCache} setStatsCache={setStatsCache}/>}
+  return <div>
+    <NavBar tab={tab} go={go} goBack={goBack} canGoBack={tabHistory.length>0}/>
+    {tab==="Home"&&<HomePage go={go} goT={goT} goP={goP} players={players} loading={loading} statsCache={statsCache}/>}
+    {tab==="Players"&&<PlayersPage players={players} loading={loading} sel={selP} setSel={setSelP} goT={goT} goP={goP} statsCache={statsCache} setStatsCache={setStatsCache} TM={TM}/>}
+    {tab==="Draft"&&<DraftPage players={players} loading={loading} statsCache={statsCache} goP={goP} goT={goT}/>}
+    {tab==="Compare"&&<ComparePage players={players} statsCache={statsCache} goP={goP}/>}
+    {tab==="Prospects"&&<ProspectsPage players={players} loading={loading} statsCache={statsCache} goP={goP} goT={goT}/>}
     {tab==="Teams"&&<Teams sel={selT} setSel={setSelT} players={players} goP={goP} statsCache={statsCache}/>}
-    {tab==="Games"&&<GamesFetch goT={goT}/>}
+    {tab==="Games & Brackets"&&<GamesFetch goT={goT}/>}
     {tab==="Brackets"&&<Brackets goT={goT}/>}
     {tab==="Predictions"&&<Predictions goT={goT} players={players} statsCache={statsCache} setStatsCache={setStatsCache}/>}
-    {tab==="Rankings"&&<Rankings players={players} statsCache={statsCache} setStatsCache={setStatsCache} goT={goT} goP={goP}/>}
+    {tab==="Defense"&&<DefensePage players={players} statsCache={statsCache} goP={goP} goT={goT}/>}
     <div style={{textAlign:'center',padding:'22px 20px',color:'var(--dm)',fontSize:12,borderTop:'1px solid var(--bd)',marginTop:32}}>
-      <span style={{fontFamily:"'Bebas Neue'",letterSpacing:1}}>GRIDIRON INTEL</span> • Powered by ESPN Public API • Real-time data from site.api.espn.com
+      <span style={{fontFamily:"'Bebas Neue'",letterSpacing:1}}>GRID IRON INTEL</span> • Powered by ESPN Public API • Offline data snapshot + live game logs
     </div>
   </div>;
 }
