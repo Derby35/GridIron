@@ -140,3 +140,38 @@ export function rankPlayers(players, statsCache) {
     .map(p => projectPlayer(p, statsCache[p.id] ?? null))
     .sort((a, b) => b.projection - a.projection);
 }
+
+// ── Enrich projected players with external draft rankings ─────────────────────
+// sleeperMap: Map<"name|pos|team" or "name|pos" → { rank }> from sleeperClient
+// espnMap:    Map<"name|pos" → { rank }> from espnFantasyClient
+// Attaches .sleeperRank and .espnRank (integer or null) to each player.
+function normalizeForLookup(name = "") {
+  return name
+    .toLowerCase()
+    .replace(/\s+(jr\.?|sr\.?|ii|iii|iv)$/i, "")
+    .replace(/[.']/g, "")
+    .trim();
+}
+
+export function enrichWithExternalRanks(projectedPlayers, sleeperMap, espnMap) {
+  if (!projectedPlayers?.length) return projectedPlayers;
+  const hasS = sleeperMap?.size > 0;
+  const hasE = espnMap?.size > 0;
+  if (!hasS && !hasE) return projectedPlayers;
+
+  return projectedPlayers.map(p => {
+    const nk = normalizeForLookup(p.nm);
+    // Sleeper: try with team first, then without (handles trades)
+    const sleeperEntry = hasS
+      ? (sleeperMap.get(`${nk}|${p.pos}|${p.tm}`) || sleeperMap.get(`${nk}|${p.pos}`))
+      : null;
+    // ESPN Fantasy: matched on name+pos only (no team in ESPN map)
+    const espnEntry = hasE ? espnMap.get(`${nk}|${p.pos}`) : null;
+
+    return {
+      ...p,
+      sleeperRank: sleeperEntry?.rank ?? null,
+      espnRank:    espnEntry?.rank    ?? null,
+    };
+  });
+}

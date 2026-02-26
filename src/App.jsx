@@ -1,6 +1,8 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { BarChart, Bar, LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, AreaChart, Area, CartesianGrid, Cell, Legend } from "recharts";
-import { rankPlayers, computeVolumeScore, computeEfficiencyScore, computeTrendScore } from "./lib/projectionEngine.js";
+import { rankPlayers, computeVolumeScore, computeEfficiencyScore, computeTrendScore, enrichWithExternalRanks } from "./lib/projectionEngine.js";
+import { fetchSleeperRankings } from "./lib/sleeperClient.js";
+import { fetchEspnFantasyRankings } from "./lib/espnFantasyClient.js";
 
 // ═══════════════════════════════════════════════════════════════
 //  ESPN API ENDPOINTS (from Public-ESPN-API docs)
@@ -1370,13 +1372,16 @@ const Predictions = ({goT, players, statsCache, setStatsCache}) => {
 const SCORE_COLORS = { volume:'var(--em)', efficiency:'var(--sk)', trend:'var(--lm)', matchup:'var(--vi)' };
 
 const Rankings = ({players, statsCache, setStatsCache, goT, goP}) => {
-  const [q,         setQ]         = useState("");
-  const [posFilter, setPosFilter] = useState("ALL");
-  const [sortKey,   setSortKey]   = useState("projection");
-  const [expanded,  setExpanded]  = useState(null);
-  const [fetching,  setFetching]  = useState(false);
-  const [fetchDone, setFetchDone] = useState(false);
-  const [progress,  setProgress]  = useState(0);
+  const [q,           setQ]           = useState("");
+  const [posFilter,   setPosFilter]   = useState("ALL");
+  const [sortKey,     setSortKey]     = useState("projection");
+  const [expanded,    setExpanded]    = useState(null);
+  const [fetching,    setFetching]    = useState(false);
+  const [fetchDone,   setFetchDone]   = useState(false);
+  const [progress,    setProgress]    = useState(0);
+  const [sleeperMap,  setSleeperMap]  = useState(new Map());
+  const [espnMap,     setEspnMap]     = useState(new Map());
+  const [extLoading,  setExtLoading]  = useState(true);
 
   // Auto-fetch stats for every offensive player in batches of 8
   useEffect(() => {
@@ -1402,23 +1407,42 @@ const Rankings = ({players, statsCache, setStatsCache, goT, goP}) => {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [players, fetchDone]);
 
+  // Fetch external draft rankings (Sleeper + ESPN Fantasy) on mount
+  useEffect(() => {
+    Promise.all([fetchSleeperRankings(), fetchEspnFantasyRankings()])
+      .then(([sMap, eMap]) => {
+        setSleeperMap(sMap);
+        setEspnMap(eMap);
+      })
+      .finally(() => setExtLoading(false));
+  }, []);
+
   const ranked = useMemo(() => rankPlayers(players, statsCache), [players, statsCache]);
 
+  // Attach .sleeperRank and .espnRank to every projected player
+  const enriched = useMemo(
+    () => enrichWithExternalRanks(ranked, sleeperMap, espnMap),
+    [ranked, sleeperMap, espnMap]
+  );
+
   const displayed = useMemo(() => {
-    let list = posFilter === "ALL" ? ranked : ranked.filter(p => p.pos === posFilter);
+    let list = posFilter === "ALL" ? enriched : enriched.filter(p => p.pos === posFilter);
     if (q) {
       const lq = q.toLowerCase();
       list = list.filter(p => p.nm.toLowerCase().includes(lq) || p.tm.toLowerCase().includes(lq));
     }
     const fns = {
-      projection: (a,b) => b.projection - a.projection,
-      volume:     (a,b) => b.volume - a.volume,
-      efficiency: (a,b) => b.efficiency - a.efficiency,
-      trend:      (a,b) => b.trend - a.trend,
-      matchup:    (a,b) => b.matchup - a.matchup,
+      projection:  (a,b) => b.projection - a.projection,
+      volume:      (a,b) => b.volume - a.volume,
+      efficiency:  (a,b) => b.efficiency - a.efficiency,
+      trend:       (a,b) => b.trend - a.trend,
+      matchup:     (a,b) => b.matchup - a.matchup,
+      // External ranks: lower number = better draft position → sort ascending; nulls last
+      sleeperRank: (a,b) => (a.sleeperRank || 9999) - (b.sleeperRank || 9999),
+      espnRank:    (a,b) => (a.espnRank    || 9999) - (b.espnRank    || 9999),
     };
     return [...list].sort(fns[sortKey] || fns.projection);
-  }, [ranked, posFilter, q, sortKey]);
+  }, [enriched, posFilter, q, sortKey]);
 
   const MiniBar = ({val, color}) => (
     <div style={{display:'flex', alignItems:'center', gap:5}}>
@@ -1466,15 +1490,30 @@ const Rankings = ({players, statsCache, setStatsCache, goT, goP}) => {
           style={{flex:1, minWidth:180, padding:'9px 13px', borderRadius:9, border:'1px solid var(--bd)',
                   background:'rgba(0,0,0,.3)', color:'var(--tx)', outline:'none', fontSize:13}}/>
         <div style={{display:'flex', gap:4, flexWrap:'wrap'}}>
-          {[['projection','Overall'],['volume','Volume'],['efficiency','Efficiency'],['trend','Trend'],['matchup','Matchup']].map(([k,l]) => (
+          {[['projection','Overall'],['volume','Volume'],['efficiency','Efficiency'],['trend','Trend'],['matchup','Matchup'],['sleeperRank','Sleeper ADP'],['espnRank','ESPN ADP']].map(([k,l]) => (
             <button key={k} onClick={() => setSortKey(k)} style={{
               padding:'5px 12px', borderRadius:7, border:'none', cursor:'pointer', fontSize:12, whiteSpace:'nowrap',
-              background: sortKey===k ? 'var(--em)' : 'rgba(255,255,255,.05)',
-              color: sortKey===k ? '#000' : 'var(--dm)', fontWeight: sortKey===k ? 800 : 500,
+              background: sortKey===k ? (k==='sleeperRank'?'#9B59B6':k==='espnRank'?'#E74C3C':'var(--em)') : 'rgba(255,255,255,.05)',
+              color: sortKey===k ? '#fff' : 'var(--dm)', fontWeight: sortKey===k ? 800 : 500,
             }}>{l}</button>
           ))}
         </div>
       </div>
+
+      {/* External rankings status */}
+      {extLoading && (
+        <div style={{marginTop:8, fontSize:11, color:'var(--dm)', display:'flex', gap:8, alignItems:'center'}}>
+          <span style={{display:'inline-block', width:8, height:8, borderRadius:'50%', background:'#9B59B6'}}/>
+          Fetching Sleeper &amp; ESPN Fantasy draft rankings…
+        </div>
+      )}
+      {!extLoading && (
+        <div style={{marginTop:8, fontSize:11, color:'var(--dm)', display:'flex', gap:12, flexWrap:'wrap'}}>
+          <span style={{color:'#9B59B6', fontWeight:700}}>● Sleeper</span>
+          <span style={{color:'#E74C3C', fontWeight:700}}>● ESPN Fantasy</span>
+          <span>draft rankings loaded · {sleeperMap.size > 0 ? `${Math.round(sleeperMap.size/2)} Sleeper players` : 'Sleeper unavailable'} · {espnMap.size > 0 ? `${espnMap.size} ESPN players` : 'ESPN Fantasy unavailable'}</span>
+        </div>
+      )}
 
       {/* Progress bar */}
       {fetching && (
@@ -1515,6 +1554,12 @@ const Rankings = ({players, statsCache, setStatsCache, goT, goP}) => {
               <th style={{...th, width:115, color:'var(--sk)'}}>Efficiency <span style={{fontSize:9, fontWeight:400}}>(25%)</span></th>
               <th style={{...th, width:115, color:'var(--lm)'}}>Trend <span style={{fontSize:9, fontWeight:400}}>(20%)</span></th>
               <th style={{...th, width:115, color:'var(--vi)'}}>Matchup <span style={{fontSize:9, fontWeight:400}}>(15%)</span></th>
+              <th style={{...th, width:70, color:'#9B59B6', cursor:'pointer'}} title="Sleeper positional search rank (lower = better)" onClick={()=>setSortKey('sleeperRank')}>
+                Sleeper{sortKey==='sleeperRank'?' ↑':' ↕'}
+              </th>
+              <th style={{...th, width:70, color:'#E74C3C', cursor:'pointer'}} title="ESPN Fantasy PPR draft rank (lower = better)" onClick={()=>setSortKey('espnRank')}>
+                ESPN{sortKey==='espnRank'?' ↑':' ↕'}
+              </th>
               <th style={{...th, width:36}}/>
             </tr>
           </thead>
@@ -1577,6 +1622,24 @@ const Rankings = ({players, statsCache, setStatsCache, goT, goP}) => {
                   <td style={td}><MiniBar val={p.trend}      color="var(--lm)"/></td>
                   <td style={td}><MiniBar val={p.matchup}    color="var(--vi)"/></td>
 
+                  {/* External draft rank columns */}
+                  <td style={{...td, textAlign:'center'}}>
+                    {extLoading
+                      ? <span style={{color:'rgba(155,89,182,.4)', fontSize:11}}>…</span>
+                      : p.sleeperRank
+                        ? <span style={{fontFamily:"'Bebas Neue'", fontSize:16, color:'#9B59B6'}}>{p.sleeperRank}</span>
+                        : <span style={{color:'rgba(255,255,255,.2)', fontSize:12}}>—</span>
+                    }
+                  </td>
+                  <td style={{...td, textAlign:'center'}}>
+                    {extLoading
+                      ? <span style={{color:'rgba(231,76,60,.4)', fontSize:11}}>…</span>
+                      : p.espnRank
+                        ? <span style={{fontFamily:"'Bebas Neue'", fontSize:16, color:'#E74C3C'}}>{p.espnRank}</span>
+                        : <span style={{color:'rgba(255,255,255,.2)', fontSize:12}}>—</span>
+                    }
+                  </td>
+
                   {/* Expand toggle */}
                   <td style={{...td, textAlign:'center', color:'var(--dm)', fontSize:12, userSelect:'none'}}>
                     {isOpen ? '▲' : '▼'}
@@ -1591,7 +1654,7 @@ const Rankings = ({players, statsCache, setStatsCache, goT, goP}) => {
                 const gp = rs?.gp || 1;
                 rows.push(
                   <tr key={`${p.id}_exp`} style={{borderBottom:'1px solid var(--bd)'}}>
-                    <td colSpan={10} style={{padding:'14px 18px', background:'rgba(0,0,0,.18)'}}>
+                    <td colSpan={12} style={{padding:'14px 18px', background:'rgba(0,0,0,.18)'}}>
                       <div style={{fontFamily:"'Bebas Neue'", fontSize:13, letterSpacing:1.5, color:'var(--em)', marginBottom:12}}>
                         WHY THIS RANK? — {p.nm}
                       </div>
@@ -1640,6 +1703,40 @@ const Rankings = ({players, statsCache, setStatsCache, goT, goP}) => {
                         <span style={{color:'var(--lm)'}}>{p.trend}×0.20</span> +{' '}
                         <span style={{color:'var(--vi)'}}>{p.matchup}×0.15</span>
                         <span style={{color:'var(--gd)', fontWeight:700, fontSize:14, marginLeft:8}}> = {p.projection}</span>
+                      </div>
+
+                      {/* External draft rank comparison */}
+                      <div style={{marginTop:10, display:'flex', gap:10, flexWrap:'wrap'}}>
+                        <div style={{background:'rgba(155,89,182,.12)', border:'1px solid rgba(155,89,182,.3)', borderRadius:8, padding:'7px 14px', display:'flex', alignItems:'center', gap:8}}>
+                          <span style={{fontSize:10, color:'#9B59B6', fontWeight:700, fontFamily:"'Barlow Condensed'", letterSpacing:.8}}>SLEEPER RANK</span>
+                          <span style={{fontFamily:"'Bebas Neue'", fontSize:22, color:'#9B59B6', lineHeight:1}}>
+                            {extLoading ? '…' : (p.sleeperRank ?? '—')}
+                          </span>
+                          {!extLoading && p.sleeperRank && <span style={{fontSize:11, color:'var(--dm)'}}>pos rank</span>}
+                        </div>
+                        <div style={{background:'rgba(231,76,60,.12)', border:'1px solid rgba(231,76,60,.3)', borderRadius:8, padding:'7px 14px', display:'flex', alignItems:'center', gap:8}}>
+                          <span style={{fontSize:10, color:'#E74C3C', fontWeight:700, fontFamily:"'Barlow Condensed'", letterSpacing:.8}}>ESPN FANTASY RANK</span>
+                          <span style={{fontFamily:"'Bebas Neue'", fontSize:22, color:'#E74C3C', lineHeight:1}}>
+                            {extLoading ? '…' : (p.espnRank ?? '—')}
+                          </span>
+                          {!extLoading && p.espnRank && <span style={{fontSize:11, color:'var(--dm)'}}>PPR</span>}
+                        </div>
+                        {!extLoading && p.sleeperRank && p.espnRank && (() => {
+                          const appRank = displayed.findIndex(x => x.id === p.id) + 1;
+                          const avg = Math.round((p.sleeperRank + p.espnRank) / 2);
+                          const diff = appRank - avg;
+                          return (
+                            <div style={{background:'rgba(255,255,255,.04)', border:'1px solid var(--bd)', borderRadius:8, padding:'7px 14px', display:'flex', alignItems:'center', gap:8}}>
+                              <span style={{fontSize:10, color:'var(--dm)', fontWeight:700, fontFamily:"'Barlow Condensed'", letterSpacing:.8}}>VS CONSENSUS</span>
+                              <span style={{fontFamily:"'Bebas Neue'", fontSize:22, color: diff < -5 ? 'var(--lm)' : diff > 5 ? 'var(--rs)' : 'var(--dm)', lineHeight:1}}>
+                                {diff > 0 ? `+${diff}` : diff}
+                              </span>
+                              <span style={{fontSize:11, color:'var(--dm)'}}>
+                                {diff < -5 ? 'ranked higher here' : diff > 5 ? 'ranked lower here' : 'consensus'}
+                              </span>
+                            </div>
+                          );
+                        })()}
                       </div>
 
                       {/* Stat pills */}
