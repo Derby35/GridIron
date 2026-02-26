@@ -363,3 +363,24 @@ export function computeMatchupScore()    { return 5.0; }
 export function projectPlayer(player, allStats) {
   return { ...player, projection:5, volume:5, efficiency:5, trend:5, matchup:5, hasData:!!allStats, recentYear:null, recentStats:null };
 }
+
+
+// ── External draft rank enrichment ────────────────────────────────────────────
+// Attaches .sleeperRank and .espnRank (integer or null) to each player.
+// sleeperMap: Map<"name|pos|team" or "name|pos" → { rank }> from sleeperClient
+// espnMap:    Map<"name|pos" → { rank }> from espnFantasyClient
+function _normForLookup(name = "") {
+  return name.toLowerCase().replace(/\s+(jr\.?|sr\.?|ii|iii|iv)$/i, "").replace(/[.']/g, "").trim();
+}
+export function enrichWithExternalRanks(projectedPlayers, sleeperMap, espnMap) {
+  if (!projectedPlayers?.length) return projectedPlayers;
+  const hasS = sleeperMap?.size > 0;
+  const hasE = espnMap?.size > 0;
+  if (!hasS && !hasE) return projectedPlayers;
+  return projectedPlayers.map(p => {
+    const nk = _normForLookup(p.nm);
+    const sEntry = hasS ? (sleeperMap.get(`${nk}|${p.pos}|${p.tm}`) || sleeperMap.get(`${nk}|${p.pos}`)) : null;
+    const eEntry = hasE ? espnMap.get(`${nk}|${p.pos}`) : null;
+    return { ...p, sleeperRank: sEntry?.rank ?? null, espnRank: eEntry?.rank ?? null };
+  });
+}

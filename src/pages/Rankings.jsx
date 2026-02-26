@@ -1,5 +1,8 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
 import { rankPlayersV2, recomputeStatsCache, DEFAULT_FORMAT } from "../engine/projectionV2.js";
+import { enrichWithExternalRanks } from "../lib/projectionEngine.js";
+import { fetchSleeperRankings } from "../lib/sleeperClient.js";
+import { fetchEspnFantasyRankings } from "../lib/espnFantasyClient.js";
 import { STATIC_DEPTH_CHARTS, STATIC_STANDINGS_25 } from "../data/teamData.js";
 import { Pil, Headshot, TeamLogo, posColor, confColor } from "../components/ui.jsx";
 
@@ -49,7 +52,7 @@ const posRankColor = rank => {
 function TierDivider({ tier }) {
   return (
     <tr>
-      <td colSpan={8} style={{ padding: "4px 0 2px" }}>
+      <td colSpan={10} style={{ padding: "4px 0 2px" }}>
         <div style={{
           display: "flex", alignItems: "center", gap: 10,
           padding: "5px 12px", borderRadius: 6,
@@ -174,6 +177,22 @@ function RankRow({ p, overallRank, goP, goT }) {
           {Math.round(p.confidence * 100)}%
         </span>
       </td>
+
+      {/* Sleeper rank */}
+      <td style={{ padding: "8px 8px", width: 62, textAlign: "center" }}>
+        {p.sleeperRank
+          ? <span style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: 16, color: "#9B59B6" }}>{p.sleeperRank}</span>
+          : <span style={{ color: "rgba(255,255,255,.18)", fontSize: 12 }}>—</span>
+        }
+      </td>
+
+      {/* ESPN Fantasy rank */}
+      <td style={{ padding: "8px 8px", width: 62, textAlign: "center" }}>
+        {p.espnRank
+          ? <span style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: 16, color: "#E74C3C" }}>{p.espnRank}</span>
+          : <span style={{ color: "rgba(255,255,255,.18)", fontSize: 12 }}>—</span>
+        }
+      </td>
     </tr>
   );
 }
@@ -196,10 +215,19 @@ function MiniScoreBar({ val, color }) {
 
 // ── Main Rankings page ────────────────────────────────────────────────────────
 export default function Rankings({ players, loading, statsCache, goP, goT }) {
-  const [posFilter, setPosFilter] = useState("ALL");
-  const [scoring,   setScoring]   = useState(DEFAULT_FORMAT.scoring);
-  const [tdPts,     setTdPts]     = useState(DEFAULT_FORMAT.tdPts);
-  const [q,         setQ]         = useState("");
+  const [posFilter,  setPosFilter]  = useState("ALL");
+  const [scoring,    setScoring]    = useState(DEFAULT_FORMAT.scoring);
+  const [tdPts,      setTdPts]      = useState(DEFAULT_FORMAT.tdPts);
+  const [q,          setQ]          = useState("");
+  const [sleeperMap, setSleeperMap] = useState(new Map());
+  const [espnMap,    setEspnMap]    = useState(new Map());
+  const [extLoading, setExtLoading] = useState(true);
+
+  useEffect(() => {
+    Promise.all([fetchSleeperRankings(), fetchEspnFantasyRankings()])
+      .then(([sMap, eMap]) => { setSleeperMap(sMap); setEspnMap(eMap); })
+      .finally(() => setExtLoading(false));
+  }, []);
 
   const format = useMemo(() => ({ scoring, tdPts }), [scoring, tdPts]);
 
@@ -210,8 +238,9 @@ export default function Rankings({ players, loading, statsCache, goP, goT }) {
 
   const allRanked = useMemo(() => {
     if (loading || !players.length) return [];
-    return rankPlayersV2(players, formatCache, STATIC_DEPTH_CHARTS, STATIC_STANDINGS_25, format);
-  }, [players, formatCache, format, loading]);
+    const ranked = rankPlayersV2(players, formatCache, STATIC_DEPTH_CHARTS, STATIC_STANDINGS_25, format);
+    return enrichWithExternalRanks(ranked, sleeperMap, espnMap);
+  }, [players, formatCache, format, loading, sleeperMap, espnMap]);
 
   const filtered = useMemo(() => {
     let list = posFilter === "ALL" ? allRanked : allRanked.filter(p => p.pos === posFilter);
@@ -269,6 +298,16 @@ export default function Rankings({ players, loading, statsCache, goP, goT }) {
                   {t.label}: {tierCounts[t.id] || 0}
                 </span>
               ))}
+            </p>
+            <p style={{ fontSize: 11, color: "var(--dm)", marginTop: 4 }}>
+              {extLoading
+                ? <span>Fetching Sleeper &amp; ESPN Fantasy draft rankings…</span>
+                : <><span style={{ color: "#9B59B6", fontWeight: 700 }}>● Sleeper</span>{" · "}
+                   <span style={{ color: "#E74C3C", fontWeight: 700 }}>● ESPN Fantasy</span>
+                   {" "}draft ranks loaded
+                   {sleeperMap.size === 0 && espnMap.size === 0 ? " (unavailable)" : ""}
+                  </>
+              }
             </p>
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 6, alignItems: "flex-end" }}>
@@ -334,6 +373,8 @@ export default function Rankings({ players, loading, statsCache, goP, goT }) {
                 <th style={{ padding: "9px 8px", width: 90, color: "var(--em)" }}>Usage<span style={{ fontSize: 9, fontWeight: 400 }}> (35%)</span></th>
                 <th style={{ padding: "9px 8px", width: 90, color: "var(--sk)" }}>Efficiency<span style={{ fontSize: 9, fontWeight: 400 }}> (15%)</span></th>
                 <th style={{ padding: "9px 8px", width: 68, color: "var(--lm)" }}>Conf</th>
+                <th style={{ padding: "9px 8px", width: 62, color: "#9B59B6", textAlign: "center" }} title="Sleeper positional search rank">Sleeper</th>
+                <th style={{ padding: "9px 8px", width: 62, color: "#E74C3C", textAlign: "center" }} title="ESPN Fantasy PPR draft rank">ESPN</th>
               </tr>
             </thead>
             <tbody>
