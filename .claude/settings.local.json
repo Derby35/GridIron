@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__Claude_Preview__preview_start",
+      "Bash(npm --version)",
+      "Bash(where npm)",
+      "Bash(npm run build)",
+      "Bash(curl -s \"http://localhost:5175/GridIron/\")",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" \"http://localhost:5176/GridIron/\")",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" \"http://127.0.0.1:5176/GridIron/\")",
+      "Bash(curl -s \"https://api.sleeper.app/v1/players/nfl\")",
+      "Bash(python3 -c \":*)",
+      "Bash(node -e \":*)",
+      "Bash(curl -s \"https://api.sleeper.app/v1/players/nfl\" -o /tmp/sleeper.json)",
+      "Bash(curl -s \"https://api.sleeper.app/v1/players/nfl\" -o \"C:/Users/tough/AppData/Local/Temp/sleeper.json\")",
+      "Bash(node \"C:/Users/tough/Desktop/gridiron-intel-app/.claude/worktrees/friendly-torvalds/test-sleeper.mjs\")",
+      "Bash(python3.exe -c \"print\\(''test''\\)\")",
+      "Bash(python -c \"print\\(''test''\\)\")",
+      "Bash(py -c \"print\\(''test''\\)\")",
+      "Bash(py -c \":*)",
+      "Bash(git add src/App.jsx src/lib/projectionEngine.js src/lib/espnFantasyClient.js src/lib/sleeperClient.js)",
+      "Bash(git commit:*)",
+      "Bash(git push -u origin claude/friendly-torvalds)",
+      "Bash(gh pr:*)",
+      "Bash(git add index.html src/)",
+      "Bash(git add src/lib/sleeperClient.js src/lib/espnFantasyClient.js src/lib/projectionEngine.js src/pages/Rankings.jsx)",
+      "Bash(git push origin main)"
+    ]
+  }
+}
