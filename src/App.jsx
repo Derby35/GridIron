@@ -385,7 +385,7 @@ const DEPTH_LABEL = {
 // ═══════════════════════════════════════════════════════════════
 //  NAV
 // ═══════════════════════════════════════════════════════════════
-const TABS = ["Home","Players","Teams","Games","Brackets","Predictions","Rankings"];
+const TABS = ["Home","Players","Teams","Games","Brackets","Predictions","Rankings","Preview"];
 const Nav = ({tab, go, goBack, canGoBack}) => (
   <div style={{position:'sticky',top:0,zIndex:50,background:'rgba(4,6,12,.85)',backdropFilter:'blur(18px)',borderBottom:'1px solid var(--bd)'}}>
     <div style={{maxWidth:1400,margin:'0 auto',display:'flex',alignItems:'center',justifyContent:'space-between',padding:'0 20px',height:58}}>
@@ -1788,6 +1788,209 @@ const Rankings = ({players, statsCache, setStatsCache, goT, goP}) => {
 };
 
 // ═══════════════════════════════════════════════════════════════
+//  PREVIEW — Draft Board Preview
+// ═══════════════════════════════════════════════════════════════
+const Preview = ({players, statsCache, setStatsCache, goP, goT}) => {
+  const [sleeperMap,  setSleeperMap]  = useState(new Map());
+  const [espnMap,     setEspnMap]     = useState(new Map());
+  const [extLoading,  setExtLoading]  = useState(true);
+  const [fetchDone,   setFetchDone]   = useState(false);
+  const [fetching,    setFetching]    = useState(false);
+  const [progress,    setProgress]    = useState(0);
+  const [hoverId,     setHoverId]     = useState(null);
+
+  // Batch-fetch stats so projections are ready
+  useEffect(() => {
+    if (fetchDone || players.length === 0) return;
+    const needed = players.filter(p => !statsCache[p.id]);
+    if (!needed.length) { setFetchDone(true); return; }
+    setFetching(true);
+    let done = 0;
+    const total = needed.length;
+    (async () => {
+      for (let i = 0; i < needed.length; i += 8) {
+        await Promise.allSettled(needed.slice(i, i + 8).map(p =>
+          fetchPlayerStats(p.id).then(data => {
+            setStatsCache(prev => ({...prev, [p.id]: data || {}}));
+            done++;
+            setProgress(Math.round((done / total) * 100));
+          }).catch(() => { done++; setProgress(Math.round((done / total) * 100)); })
+        ));
+      }
+      setFetching(false);
+      setFetchDone(true);
+    })();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [players, fetchDone]);
+
+  // Fetch Sleeper + ESPN ADP
+  useEffect(() => {
+    Promise.all([fetchSleeperRankings(), fetchEspnFantasyRankings()])
+      .then(([sMap, eMap]) => { setSleeperMap(sMap); setEspnMap(eMap); })
+      .finally(() => setExtLoading(false));
+  }, []);
+
+  const ranked   = useMemo(() => rankPlayers(players, statsCache), [players, statsCache]);
+  const enriched = useMemo(() => enrichWithExternalRanks(ranked, sleeperMap, espnMap), [ranked, sleeperMap, espnMap]);
+
+  // Top 10 per position
+  const byPos = useMemo(() => {
+    const map = {QB:[], RB:[], WR:[], TE:[]};
+    for (const p of enriched) {
+      if (map[p.pos] && map[p.pos].length < 10) map[p.pos].push(p);
+    }
+    return map;
+  }, [enriched]);
+
+  const projColor = v => v >= 7 ? 'var(--lm)' : v >= 5 ? 'var(--gd)' : v >= 3 ? 'var(--em)' : 'var(--rs)';
+
+  const PosHeader = ({pos}) => (
+    <div style={{
+      display:'flex', alignItems:'center', gap:8, padding:'10px 14px',
+      background:`${posColor(pos)}18`, borderBottom:`2px solid ${posColor(pos)}`,
+      borderRadius:'12px 12px 0 0',
+    }}>
+      <Pil ch={pos} c={posColor(pos)} s={{fontSize:13, padding:'3px 10px'}}/>
+      <span style={{fontFamily:"'Bebas Neue'", fontSize:18, letterSpacing:1, color:posColor(pos)}}>
+        {pos==="QB"?"Quarterbacks":pos==="RB"?"Running Backs":pos==="WR"?"Wide Receivers":"Tight Ends"}
+      </span>
+    </div>
+  );
+
+  const PlayerRow = ({p, rank}) => {
+    const isHovered = hoverId === p.id;
+    const pc = posColor(p.pos);
+    const rs = p.recentStats;
+    const statLine = rs ? (
+      p.pos==="QB"  ? `${(rs.passYd||0).toLocaleString()} yds · ${rs.passTD||0} TD` :
+      p.pos==="RB"  ? `${(rs.rushYd||0).toLocaleString()} rush · ${rs.rec||0} rec` :
+                      `${rs.rec||0} rec · ${(rs.recYd||0).toLocaleString()} yds`
+    ) : null;
+
+    return (
+      <div
+        onMouseEnter={() => setHoverId(p.id)}
+        onMouseLeave={() => setHoverId(null)}
+        style={{
+          display:'flex', alignItems:'center', gap:10, padding:'10px 14px',
+          borderBottom:'1px solid var(--bd)',
+          background: isHovered ? `${pc}10` : 'transparent',
+          transition:'background .15s', cursor:'pointer',
+        }}
+        onClick={() => goP(p.id)}
+      >
+        {/* Rank */}
+        <div style={{
+          minWidth:26, height:26, borderRadius:7,
+          background: rank===1?`${pc}30`:rank<=3?'rgba(255,255,255,.06)':'transparent',
+          border: rank<=3?`1px solid ${rank===1?pc:'var(--bd)'}`:'none',
+          display:'flex', alignItems:'center', justifyContent:'center',
+          fontFamily:"'Bebas Neue'", fontSize:14,
+          color: rank===1?pc:'var(--dm)',
+        }}>{rank}</div>
+
+        {/* Headshot */}
+        <img src={p.hs} alt={p.nm} width={38} height={38} className="hs"
+          onError={e=>{e.target.style.opacity='.2'}}/>
+
+        {/* Name + stat line */}
+        <div style={{flex:1, minWidth:0}}>
+          <div style={{
+            fontWeight:800, fontSize:14,
+            overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap',
+            color: isHovered ? pc : 'var(--tx)',
+            transition:'color .15s',
+          }}>{p.nm}</div>
+          <div style={{display:'flex', alignItems:'center', gap:5, marginTop:2}}>
+            <div style={{cursor:'pointer'}} onClick={e=>{e.stopPropagation();goT(p.tm)}}>
+              <Logo ab={p.tm} sz={14}/>
+            </div>
+            <span style={{fontSize:11, color:'var(--dm)'}}>{p.tm}</span>
+            {statLine && <span style={{fontSize:11, color:'rgba(232,236,248,.3)'}}>· {statLine}</span>}
+          </div>
+        </div>
+
+        {/* Projection badge */}
+        <div style={{textAlign:'right', flexShrink:0}}>
+          <div style={{fontFamily:"'Bebas Neue'", fontSize:22, lineHeight:1, color:projColor(p.projection)}}>
+            {p.projection}
+          </div>
+          <div style={{display:'flex', gap:4, marginTop:3, justifyContent:'flex-end'}}>
+            {p.sleeperRank && !extLoading &&
+              <span style={{fontSize:9, background:'rgba(155,89,182,.18)', color:'#9B59B6', borderRadius:4, padding:'1px 4px', fontWeight:700}}>S:{p.sleeperRank}</span>}
+            {p.espnRank && !extLoading &&
+              <span style={{fontSize:9, background:'rgba(231,76,60,.18)', color:'#E74C3C', borderRadius:4, padding:'1px 4px', fontWeight:700}}>E:{p.espnRank}</span>}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  return <div className="fu" style={{maxWidth:1400, margin:'0 auto', padding:'24px 20px'}}>
+
+    {/* Header */}
+    <div style={{background:'var(--s1)', border:'1px solid var(--bd)', borderRadius:14, padding:18, marginBottom:16}}>
+      <div style={{display:'flex', alignItems:'flex-start', justifyContent:'space-between', flexWrap:'wrap', gap:12}}>
+        <div>
+          <Pil ch="DRAFT BOARD" c="var(--gd)" s={{marginBottom:10, display:'inline-flex', fontSize:11}}/>
+          <h2 style={{fontFamily:"'Bebas Neue'", fontSize:32, letterSpacing:1.5, marginBottom:4}}>
+            2025 SEASON PREVIEW
+          </h2>
+          <p style={{color:'var(--dm)', fontSize:13, lineHeight:1.6, maxWidth:560}}>
+            Top 10 players at each position ranked by our opportunity-first projection model.
+            Scores combine <span style={{color:'var(--em)', fontWeight:700}}>volume</span>,{' '}
+            <span style={{color:'var(--sk)', fontWeight:700}}>efficiency</span>,{' '}
+            <span style={{color:'var(--lm)', fontWeight:700}}>trend</span>, and{' '}
+            <span style={{color:'var(--vi)', fontWeight:700}}>matchup</span> on a 0–10 scale.
+          </p>
+        </div>
+        <div style={{display:'flex', gap:8, flexWrap:'wrap', alignItems:'flex-start'}}>
+          {extLoading
+            ? <Pil ch="Loading ADP…" c="var(--dm)" s={{fontSize:11}}/>
+            : <>
+                <Pil ch="● Sleeper ADP" c="#9B59B6" s={{fontSize:11}}/>
+                <Pil ch="● ESPN ADP"    c="#E74C3C" s={{fontSize:11}}/>
+              </>
+          }
+        </div>
+      </div>
+
+      {/* Progress bar while fetching */}
+      {fetching && (
+        <div style={{marginTop:12}}>
+          <div style={{display:'flex', justifyContent:'space-between', fontSize:12, color:'var(--dm)', marginBottom:4}}>
+            <span>Building projections from ESPN stats…</span>
+            <span>{progress}%</span>
+          </div>
+          <div style={{height:4, background:'rgba(255,255,255,.06)', borderRadius:99, overflow:'hidden'}}>
+            <div style={{width:`${progress}%`, height:'100%', background:'linear-gradient(90deg,var(--em),var(--gd))', borderRadius:99, transition:'width .3s'}}/>
+          </div>
+        </div>
+      )}
+    </div>
+
+    {/* 4-column draft board */}
+    <div style={{display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:12}}>
+      {['QB','RB','WR','TE'].map(pos => (
+        <div key={pos} style={{background:'var(--s1)', border:'1px solid var(--bd)', borderRadius:12, overflow:'hidden'}}>
+          <PosHeader pos={pos}/>
+          {byPos[pos].length === 0
+            ? <div style={{padding:30, textAlign:'center', color:'var(--dm)', fontSize:13}}>
+                {fetching || players.length === 0 ? 'Loading…' : 'No data'}
+              </div>
+            : byPos[pos].map((p, i) => <PlayerRow key={p.id} p={p} rank={i+1}/>)
+          }
+        </div>
+      ))}
+    </div>
+
+    <div style={{marginTop:12, color:'var(--dm)', fontSize:12, padding:'0 4px', lineHeight:1.7}}>
+      * Projection score is 0–10. S: = Sleeper positional rank · E: = ESPN Fantasy PPR rank · Click any player to view full stats.
+    </div>
+  </div>;
+};
+
+// ═══════════════════════════════════════════════════════════════
 //  APP — Main Component
 // ═══════════════════════════════════════════════════════════════
 export default function App() {
@@ -1828,6 +2031,7 @@ export default function App() {
     {tab==="Brackets"&&<Brackets goT={goT}/>}
     {tab==="Predictions"&&<Predictions goT={goT} players={players} statsCache={statsCache} setStatsCache={setStatsCache}/>}
     {tab==="Rankings"&&<Rankings players={players} statsCache={statsCache} setStatsCache={setStatsCache} goT={goT} goP={goP}/>}
+    {tab==="Preview"&&<Preview players={players} statsCache={statsCache} setStatsCache={setStatsCache} goP={goP} goT={goT}/>}
     <div style={{textAlign:'center',padding:'22px 20px',color:'var(--dm)',fontSize:12,borderTop:'1px solid var(--bd)',marginTop:32}}>
       <span style={{fontFamily:"'Bebas Neue'",letterSpacing:1}}>GRIDIRON INTEL</span> • Powered by ESPN Public API • Real-time data from site.api.espn.com
     </div>
