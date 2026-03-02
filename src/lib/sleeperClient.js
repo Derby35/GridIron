@@ -73,7 +73,7 @@ export async function fetchSleeperRankings() {
         || `${p.first_name || ""} ${p.last_name || ""}`.trim();
       if (!fullName) continue;
 
-      const payload = { rank, pos, team };
+      const payload = { rank, pos, team, depthOrder: p.depth_chart_order ?? 99 };
       // Both keys point to same payload; Map keeps latest on duplicate key
       entries.push([nameKey(fullName, pos, team),  payload]);
       entries.push([nameKeyNoTeam(fullName, pos),  payload]);

@@ -1,18 +1,24 @@
 // ─────────────────────────────────────────────────────────────────────────────
 //  ESPN Fantasy Data Layer  ·  Public draft rankings (no auth required)
-//  Falls back gracefully to an empty Map if the endpoint is unavailable.
-//
-//  Uses PPR rank preferentially, then STANDARD, then HALF.
+//  Uses X-Fantasy-Filter header to fetch ranked offensive players sorted by PPR ADP.
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ESPN Fantasy defaultPositionId → fantasy position string
-const ESPN_POS = { 1: "QB", 2: "RB", 3: "WR", 4: "TE" };
+const ESPN_POS = { 1: "QB", 2: "RB", 3: "WR", 4: "TE", 5: "K" };
 
-// Public endpoint — no credentials needed (may 401 in future; handled gracefully)
-const ESPN_FANTASY_URL =
-  "https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl/seasons/2025/players" +
-  "?view=kona_player_info&scoringPeriodId=0&limit=2000";
+// Slot IDs for QB(0), RB(2), WR(4), TE(6), K(17), FLEX(23) — filters offensive skill + kicker positions
+const FANTASY_FILTER = JSON.stringify({
+  players: {
+    filterSlotIds:            { value: [0, 2, 4, 6, 17, 23] },
+    limit:                    300,
+    offset:                   0,
+    sortDraftRanks:           { sortPriority: 2, sortAsc: true, value: "PPR" },
+    filterRanksForScoringPeriodIds: { value: [0] },
+    filterRanksForRankTypes:  { value: ["PPR"] },
+  },
+});
 
+const BASE_URL  = "https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl/seasons/2025/players?view=kona_player_info&scoringPeriodId=0";
 const CACHE_PFX = "gi_";
 const HR12      = 12 * 60 * 60 * 1000;
 
@@ -31,7 +37,6 @@ function cacheWrite(key, data, ttlMs) {
   } catch {}
 }
 
-// Same normalization as sleeperClient so keys are consistent across sources
 function normalizeName(name = "") {
   return name
     .toLowerCase()
@@ -40,12 +45,11 @@ function normalizeName(name = "") {
     .trim();
 }
 
-// ESPN Fantasy doesn't easily expose team abbreviations, so match on name+pos only
 function nameKey(fullName, pos) {
   return `${normalizeName(fullName)}|${pos}`;
 }
 
-// ── Fetch ESPN Fantasy draft rankings ─────────────────────────────────────────
+// ── Fetch ESPN Fantasy PPR draft rankings ────────────────────────────────────
 // Returns Map<"normalizedName|pos" → { rank, pos }>
 // 12-hour cache; returns empty Map on any error (non-blocking).
 export async function fetchEspnFantasyRankings() {
@@ -53,36 +57,36 @@ export async function fetchEspnFantasyRankings() {
   if (cached) return new Map(cached);
 
   try {
-    const r = await fetch(ESPN_FANTASY_URL, {
-      headers: { Accept: "application/json" },
+    const r = await fetch(BASE_URL, {
+      headers: {
+        Accept:            "application/json",
+        "X-Fantasy-Filter": FANTASY_FILTER,
+      },
     });
     if (!r.ok) throw new Error(`ESPN Fantasy API ${r.status}`);
     const body = await r.json();
 
-    // Response shape varies: { players: [...] } or bare array
-    const list = Array.isArray(body) ? body : (body?.players || []);
+    // Response is an object with numeric string keys — use Object.values()
+    const list = Object.values(body);
     if (!list.length) throw new Error("Empty ESPN Fantasy response");
 
     const entries = [];
     for (const item of list) {
-      const draftRanks = item.draftRanksByRankType || {};
-      const rank =
-        draftRanks?.PPR?.rank      ||
-        draftRanks?.STANDARD?.rank ||
-        draftRanks?.HALF?.rank;
-      if (!rank) continue;
-
-      // Player info at item.playerPoolEntry.player or item.player
-      const player   = item.playerPoolEntry?.player || item.player || {};
-      const fullName = player.fullName || player.name || "";
+      // Player data is at the top level of each item
+      const fullName = item.fullName || item.name || "";
       if (!fullName) continue;
 
-      const pos = ESPN_POS[player.defaultPositionId];
+      const pos = ESPN_POS[item.defaultPositionId];
       if (!pos) continue;
+
+      const ranks = item.draftRanksByRankType || {};
+      const rank  = ranks?.PPR?.rank || ranks?.STANDARD?.rank || ranks?.HALF?.rank;
+      if (!rank) continue;
 
       entries.push([nameKey(fullName, pos), { rank, pos }]);
     }
 
+    if (!entries.length) throw new Error("No ranked players parsed");
     cacheWrite("espn_fantasy_ranks", entries, HR12);
     return new Map(entries);
   } catch (e) {
