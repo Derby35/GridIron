@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { BarChart, Bar, LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, AreaChart, Area, CartesianGrid, Cell, Legend } from "recharts";
 import { rankPlayers, computeVolumeScore, computeEfficiencyScore, computeTrendScore, enrichWithExternalRanks } from "./lib/projectionEngine.js";
-import { fetchSleeperRankings } from "./lib/sleeperClient.js";
+import { fetchSleeperRankings, normalizeName } from "./lib/sleeperClient.js";
 import { fetchEspnFantasyRankings } from "./lib/espnFantasyClient.js";
 import { runExploitEngine, rankToImpliedPoints } from "./lib/marketEngine.js";
 
@@ -1087,7 +1087,7 @@ const Players = ({players,loading,sel,setSel,goT,statsCache,setStatsCache}) => {
 // ═══════════════════════════════════════════════════════════════
 //  TEAMS PAGE
 // ═══════════════════════════════════════════════════════════════
-const Teams = ({sel,setSel,players,goP,statsCache}) => {
+const Teams = ({sel,setSel,players,goP,statsCache,sleeperMap}) => {
   const[conf,setConf]=useState("ALL");
   const[depthChart,setDepthChart]=useState({});
   const[loadingDepth,setLoadingDepth]=useState(false);
@@ -1109,39 +1109,53 @@ const Teams = ({sel,setSel,players,goP,statsCache}) => {
     }).catch(()=>setLoadingDepth(false));
   },[sel]);
 
+  // Look up Sleeper depth_chart_order for a player (1=starter, 2=backup…)
+  const sleeperDepthOrder = (p) => {
+    if (!sleeperMap?.size) return 99;
+    const nk = normalizeName(p.nm);
+    return sleeperMap.get(`${nk}|${p.pos}|${p.tm}`)?.depthOrder
+        ?? sleeperMap.get(`${nk}|${p.pos}`)?.depthOrder
+        ?? 99;
+  };
+
   // Sort a position group:
   //   1. Official ESPN depth chart if available
-  //   2. Stats-based (weighted recent PPR) for players not in the chart or when no chart
-  //   3. Experience years as final tiebreaker — never raw jersey number
+  //   2. Sleeper depth_chart_order (reliable fallback when ESPN is empty)
+  //   3. Stats-based (weighted recent PPR) as final fallback
   const sortByDepth = (group, pos) => {
     const order = depthChart[pos];
     const statSort = (a, b) => {
       const as = playerStatScore(a, statsCache);
       const bs = playerStatScore(b, statsCache);
-      if (as !== -1 && bs !== -1 && as !== bs) return bs - as;  // higher stats first
-      if (as !== -1 && bs === -1) return -1;   // a has stats, b doesn't
-      if (as === -1 && bs !== -1) return 1;    // b has stats, a doesn't
-      // No stats for either — use experience then age
+      if (as !== -1 && bs !== -1 && as !== bs) return bs - as;
+      if (as !== -1 && bs === -1) return -1;
+      if (as === -1 && bs !== -1) return 1;
       const ae = a.exp ?? -1, be = b.exp ?? -1;
       if (ae !== be) return be - ae;
       return (b.age || 0) - (a.age || 0);
+    };
+    const sleeperSort = (a, b) => {
+      const ao = sleeperDepthOrder(a), bo = sleeperDepthOrder(b);
+      if (ao !== bo) return ao - bo;
+      return statSort(a, b);
     };
 
     if (order && order.length > 0) {
       return [...group].sort((a, b) => {
         const ai = order.indexOf(String(a.id));
         const bi = order.indexOf(String(b.id));
-        if (ai !== -1 && bi !== -1) return ai - bi;   // both in official chart
-        if (ai !== -1) return -1;                      // a is charted, b isn't
-        if (bi !== -1) return 1;                       // b is charted, a isn't
-        return statSort(a, b);                         // neither charted → stats
+        if (ai !== -1 && bi !== -1) return ai - bi;
+        if (ai !== -1) return -1;
+        if (bi !== -1) return 1;
+        return sleeperSort(a, b);
       });
     }
-    // No official chart at all → rank entirely by stats/experience
+    if (sleeperMap?.size > 0) return [...group].sort(sleeperSort);
     return [...group].sort(statSort);
   };
 
   const hasOfficialChart = Object.keys(depthChart).length > 0;
+  const hasSleeperChart = sleeperMap?.size > 0;
 
   return <div className="fu" style={{padding:'24px 24px'}}><div style={{display:'grid',gridTemplateColumns:'280px 1fr',gap:18}}>
     <div>
@@ -1162,7 +1176,9 @@ const Teams = ({sel,setSel,players,goP,statsCache}) => {
             ? <span style={{color:'var(--dm)',fontSize:11,fontStyle:'italic'}}>Loading depth chart…</span>
             : hasOfficialChart
               ? <Pil ch="OFFICIAL DEPTH CHART" c="var(--lm)" s={{fontSize:10}}/>
-              : <Pil ch="STATS-BASED RANKING" c="var(--sk)" s={{fontSize:10}}/>
+              : hasSleeperChart
+                ? <Pil ch="SLEEPER DEPTH ORDER" c="var(--sk)" s={{fontSize:10}}/>
+                : <Pil ch="STATS-BASED RANKING" c="var(--vi)" s={{fontSize:10}}/>
           }
         </div>
         {["QB","RB","WR","TE","K"].map(pos=>{
@@ -2067,7 +2083,7 @@ const SCORE_COLORS = { volume:'var(--em)', efficiency:'var(--sk)', trend:'var(--
 const Rankings = ({players, statsCache, setStatsCache, goT, goP, sleeperMap, espnMap, extLoading}) => {
   const [q,           setQ]           = useState("");
   const [posFilter,   setPosFilter]   = useState("ALL");
-  const [sortKey,     setSortKey]     = useState("projection");
+  const [sortKey,     setSortKey]     = useState("pts2024");
   const [expanded,    setExpanded]    = useState(null);
   const [fetching,    setFetching]    = useState(false);
   const [fetchDone,   setFetchDone]   = useState(false);
@@ -2105,13 +2121,38 @@ const Rankings = ({players, statsCache, setStatsCache, goT, goP, sleeperMap, esp
     [ranked, sleeperMap, espnMap]
   );
 
+  // Attach 2024 actual PPR points to every player
+  const withPts = useMemo(() =>
+    enriched.map(p => ({
+      ...p,
+      fpts2024: statsCache[p.id]?.[2024]?.fpts || 0,
+    })),
+    [enriched, statsCache]
+  );
+
+  // Position class rank: WR1, WR2, RB1, QB2… sorted by fpts2024 within each position
+  const posRanks = useMemo(() => {
+    const byPos = {};
+    for (const p of withPts) {
+      if (!byPos[p.pos]) byPos[p.pos] = [];
+      byPos[p.pos].push(p);
+    }
+    const ranks = {};
+    for (const [pos, arr] of Object.entries(byPos)) {
+      arr.sort((a, b) => b.fpts2024 - a.fpts2024);
+      arr.forEach((p, i) => { ranks[p.id] = `${pos}${i + 1}`; });
+    }
+    return ranks;
+  }, [withPts]);
+
   const displayed = useMemo(() => {
-    let list = posFilter === "ALL" ? enriched : enriched.filter(p => p.pos === posFilter);
+    let list = posFilter === "ALL" ? withPts : withPts.filter(p => p.pos === posFilter);
     if (q) {
       const lq = q.toLowerCase();
       list = list.filter(p => p.nm.toLowerCase().includes(lq) || p.tm.toLowerCase().includes(lq));
     }
     const fns = {
+      pts2024:     (a,b) => b.fpts2024 - a.fpts2024,
       projection:  (a,b) => b.projection - a.projection,
       volume:      (a,b) => b.volume - a.volume,
       efficiency:  (a,b) => b.efficiency - a.efficiency,
@@ -2121,8 +2162,8 @@ const Rankings = ({players, statsCache, setStatsCache, goT, goP, sleeperMap, esp
       sleeperRank: (a,b) => (a.sleeperRank || 9999) - (b.sleeperRank || 9999),
       espnRank:    (a,b) => (a.espnRank    || 9999) - (b.espnRank    || 9999),
     };
-    return [...list].sort(fns[sortKey] || fns.projection);
-  }, [enriched, posFilter, q, sortKey]);
+    return [...list].sort(fns[sortKey] || fns.pts2024);
+  }, [withPts, posFilter, q, sortKey]);
 
   const MiniBar = ({val, color}) => (
     <div style={{display:'flex', alignItems:'center', gap:5}}>
@@ -2142,14 +2183,14 @@ const Rankings = ({players, statsCache, setStatsCache, goT, goP, sleeperMap, esp
       <div style={{display:'flex', alignItems:'flex-start', justifyContent:'space-between', flexWrap:'wrap', gap:12, marginBottom:12}}>
         <div>
           <h2 style={{fontFamily:"'Bebas Neue'", fontSize:28, letterSpacing:1.5, marginBottom:4}}>
-            OPPORTUNITY-FIRST RANKINGS
+            2024 PPR RANKINGS
           </h2>
           <p style={{color:'var(--dm)', fontSize:13, lineHeight:1.7}}>
-            <span style={{color:'var(--em)',  fontWeight:700}}>40% Volume</span> ·{' '}
-            <span style={{color:'var(--sk)',  fontWeight:700}}>25% Efficiency</span> ·{' '}
-            <span style={{color:'var(--lm)', fontWeight:700}}>20% Trend</span> ·{' '}
-            <span style={{color:'var(--vi)', fontWeight:700}}>15% Matchup</span>
-            <span style={{color:'var(--dm)', fontSize:11}}> · click any row to see the breakdown</span>
+            <span style={{color:'var(--gd)', fontWeight:700}}>2024 Actual PPR Points</span>
+            <span style={{color:'var(--dm)'}}> · </span>
+            <span style={{color:'var(--em)', fontWeight:700}}>WR1/WR2/RB1</span>
+            <span style={{color:'var(--dm)'}}> position class within group · </span>
+            <span style={{color:'var(--dm)', fontSize:11}}>click any row for projection breakdown</span>
           </p>
         </div>
         {/* Position filter */}
@@ -2170,11 +2211,11 @@ const Rankings = ({players, statsCache, setStatsCache, goT, goP, sleeperMap, esp
           style={{flex:1, minWidth:180, padding:'9px 13px', borderRadius:9, border:'1px solid var(--bd)',
                   background:'rgba(0,0,0,.3)', color:'var(--tx)', outline:'none', fontSize:13}}/>
         <div style={{display:'flex', gap:4, flexWrap:'wrap'}}>
-          {[['projection','Overall'],['volume','Volume'],['efficiency','Efficiency'],['trend','Trend'],['matchup','Matchup'],['sleeperRank','Sleeper ADP'],['espnRank','ESPN ADP']].map(([k,l]) => (
+          {[['pts2024','2024 PPR Pts'],['projection','Projection'],['volume','Volume'],['efficiency','Efficiency'],['trend','Trend'],['matchup','Matchup'],['sleeperRank','Sleeper ADP'],['espnRank','ESPN ADP']].map(([k,l]) => (
             <button key={k} onClick={() => setSortKey(k)} style={{
               padding:'5px 12px', borderRadius:7, border:'none', cursor:'pointer', fontSize:12, whiteSpace:'nowrap',
-              background: sortKey===k ? (k==='sleeperRank'?'#C084FC':k==='espnRank'?'#FF3D5A':'var(--em)') : 'rgba(255,255,255,.05)',
-              color: sortKey===k ? '#fff' : 'var(--dm)', fontWeight: sortKey===k ? 800 : 500,
+              background: sortKey===k ? (k==='pts2024'?'var(--gd)':k==='sleeperRank'?'#C084FC':k==='espnRank'?'#FF3D5A':'var(--em)') : 'rgba(255,255,255,.05)',
+              color: sortKey===k ? (k==='pts2024'?'#000':'#fff') : 'var(--dm)', fontWeight: sortKey===k ? 800 : 500,
             }}>{l}</button>
           ))}
         </div>
@@ -2226,14 +2267,18 @@ const Rankings = ({players, statsCache, setStatsCache, goT, goP, sleeperMap, esp
           <thead>
             <tr style={{borderBottom:'2px solid var(--bd)', background:'rgba(0,0,0,.25)'}}>
               <th style={{...th, width:36}}>#</th>
+              <th style={{...th, width:55, color:'var(--em)', cursor:'pointer'}} title="Position class rank by 2024 PPR points" onClick={()=>setSortKey('pts2024')}>Class</th>
               <th style={th}>Player</th>
               <th style={{...th, width:46}}>Pos</th>
               <th style={{...th, width:60}}>Team</th>
-              <th style={{...th, width:130}}>Projection</th>
-              <th style={{...th, width:115, color:'var(--em)'}}>Volume <span style={{fontSize:9, fontWeight:400}}>(40%)</span></th>
-              <th style={{...th, width:115, color:'var(--sk)'}}>Efficiency <span style={{fontSize:9, fontWeight:400}}>(25%)</span></th>
-              <th style={{...th, width:115, color:'var(--lm)'}}>Trend <span style={{fontSize:9, fontWeight:400}}>(20%)</span></th>
-              <th style={{...th, width:115, color:'var(--vi)'}}>Matchup <span style={{fontSize:9, fontWeight:400}}>(15%)</span></th>
+              <th style={{...th, width:85, color:'var(--gd)', cursor:'pointer'}} title="2024 actual PPR fantasy points total" onClick={()=>setSortKey('pts2024')}>
+                2024 Pts{sortKey==='pts2024'?' ↑':' ↕'}
+              </th>
+              <th style={{...th, width:115}}>Projection</th>
+              <th style={{...th, width:100, color:'var(--em)'}}>Volume <span style={{fontSize:9, fontWeight:400}}>(40%)</span></th>
+              <th style={{...th, width:100, color:'var(--sk)'}}>Efficiency <span style={{fontSize:9, fontWeight:400}}>(25%)</span></th>
+              <th style={{...th, width:100, color:'var(--lm)'}}>Trend <span style={{fontSize:9, fontWeight:400}}>(20%)</span></th>
+              <th style={{...th, width:100, color:'var(--vi)'}}>Matchup <span style={{fontSize:9, fontWeight:400}}>(15%)</span></th>
               <th style={{...th, width:70, color:'#C084FC', cursor:'pointer'}} title="Sleeper positional search rank (lower = better)" onClick={()=>setSortKey('sleeperRank')}>
                 Sleeper{sortKey==='sleeperRank'?' ↑':' ↕'}
               </th>
@@ -2259,6 +2304,18 @@ const Rankings = ({players, statsCache, setStatsCache, goT, goP, sleeperMap, esp
 
                   <td style={{...td, color:'var(--dm)', fontWeight:700, fontSize:12}}>{i+1}</td>
 
+                  {/* Position class badge: WR1, RB2, QB1… */}
+                  <td style={{...td, textAlign:'center'}}>
+                    {posRanks[p.id]
+                      ? <span style={{fontFamily:"'Bebas Neue'", fontSize:13, color:pc,
+                          background:`${pc}18`, border:`1px solid ${pc}40`,
+                          padding:'2px 6px', borderRadius:5, whiteSpace:'nowrap'}}>
+                          {posRanks[p.id]}
+                        </span>
+                      : <span style={{color:'rgba(255,255,255,.2)', fontSize:12}}>—</span>
+                    }
+                  </td>
+
                   {/* Player */}
                   <td style={td}>
                     <div style={{display:'flex', alignItems:'center', gap:10}}>
@@ -2282,6 +2339,14 @@ const Rankings = ({players, statsCache, setStatsCache, goT, goP, sleeperMap, esp
                       <Logo ab={p.tm} sz={22}/>
                       <span style={{fontSize:12, color:'var(--dm)'}}>{p.tm}</span>
                     </div>
+                  </td>
+
+                  {/* 2024 actual PPR points */}
+                  <td style={{...td, textAlign:'center'}}>
+                    {p.fpts2024 > 0
+                      ? <span style={{fontFamily:"'Bebas Neue'", fontSize:20, color:'var(--gd)'}}>{Math.round(p.fpts2024)}</span>
+                      : <span style={{color:'rgba(255,255,255,.2)', fontSize:12}}>—</span>
+                    }
                   </td>
 
                   {/* Overall projection */}
@@ -2334,7 +2399,7 @@ const Rankings = ({players, statsCache, setStatsCache, goT, goP, sleeperMap, esp
                 const gp = rs?.gp || 1;
                 rows.push(
                   <tr key={`${p.id}_exp`} style={{borderBottom:'1px solid var(--bd)'}}>
-                    <td colSpan={12} style={{padding:'14px 18px', background:'rgba(0,0,0,.18)'}}>
+                    <td colSpan={14} style={{padding:'14px 18px', background:'rgba(0,0,0,.18)'}}>
                       <div style={{fontFamily:"'Bebas Neue'", fontSize:13, letterSpacing:1.5, color:'var(--em)', marginBottom:12}}>
                         WHY THIS RANK? — {p.nm}
                       </div>
@@ -2526,7 +2591,7 @@ export default function App() {
     <div style={{marginLeft:220,flex:1,minWidth:0,display:'flex',flexDirection:'column'}}>
       {tab==="Home"&&<Home go={go} goT={goT} goP={goP} players={players} loading={loading} statsCache={statsCache}/>}
       {tab==="Players"&&<Players players={players} loading={loading} sel={selP} setSel={setSelP} goT={goT} statsCache={statsCache} setStatsCache={setStatsCache}/>}
-      {tab==="Teams"&&<Teams sel={selT} setSel={setSelT} players={players} goP={goP} statsCache={statsCache}/>}
+      {tab==="Teams"&&<Teams sel={selT} setSel={setSelT} players={players} goP={goP} statsCache={statsCache} sleeperMap={sleeperMap}/>}
       {tab==="Games"&&<GamesFetch goT={goT}/>}
       {tab==="Brackets"&&<Brackets goT={goT}/>}
       {tab==="Predictions"&&<Predictions goT={goT} players={players} statsCache={statsCache} setStatsCache={setStatsCache}/>}
