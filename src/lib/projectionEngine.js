@@ -66,10 +66,13 @@ export function computeVolumeScore(stats, pos) {
   if (!stats) return 0;
   const gp = Math.max(stats.gp || 1, 1);
 
+  // Games-played penalty: players with few games get proportionally less volume credit
+  const gpPct = Math.min((stats.gp || 0) / 10, 1); // full credit at 10+ games
+
   // Kicker: volume = field goal attempts per game (3.5/g = elite)
   if (pos === "K") {
     const fgaPerGame = safeDiv(stats.fga || 0, gp);
-    return fmt2(clamp(fgaPerGame / 3.5 * 10, 0, 10));
+    return fmt2(clamp(fgaPerGame / 3.5 * 10 * gpPct, 0, 10));
   }
 
   // League-average thresholds per position per game
@@ -93,7 +96,7 @@ export function computeVolumeScore(stats, pos) {
   const carryShare  = clamp(rushPG / (LEAG_RUSH_PG[pos] || 5), 0, 1);
 
   const expectedVolume = snapShare * 0.4 + targetShare * 0.3 + carryShare * 0.3;
-  return fmt2(clamp(expectedVolume * 10, 0, 10)); // scale to 0–10
+  return fmt2(clamp(expectedVolume * 10 * gpPct, 0, 10)); // scale to 0–10, penalize low game counts
 }
 
 // ── 2. Efficiency Score (0–10) ────────────────────────────────────────────────
@@ -266,7 +269,7 @@ function computeRiskMultiplier(recentStats, allStats) {
 }
 
 // ── Per-player projection ──────────────────────────────────────────────────────
-export function projectPlayer(player, allStats, teamWins = null) {
+export function projectPlayer(player, allStats, teamWins = null, depthOrder = 2, weather = null) {
   const years = allStats
     ? Object.keys(allStats).map(Number).sort((a, b) => b - a)
     : [];
@@ -283,11 +286,36 @@ export function projectPlayer(player, allStats, teamWins = null) {
   const contextMult = computeContextMultiplier(player, recentStats, allStats, teamWins);
   const riskMult    = computeRiskMultiplier(recentStats, allStats);
 
+  // Depth chart opportunity multiplier: starter = boost, backup = neutral, deep = penalty
+  const depthMult = depthOrder === 1 ? 1.12 : depthOrder === 2 ? 0.90 : 0.65;
+
+  // Weather multiplier: affects outdoor games by position
+  let wxMult = 1.0;
+  if (weather && !weather.isIndoor) {
+    const wind = weather.wind || 0;
+    const temp = weather.temp ?? 65;
+    if (wind > 25) {
+      wxMult = player.pos === "K"  ? 0.78
+             : player.pos === "QB" ? 0.91
+             : (player.pos === "WR" || player.pos === "TE") ? 0.87
+             : 1.0; // RB unaffected by wind
+    } else if (wind > 15) {
+      wxMult = player.pos === "K"  ? 0.88
+             : player.pos === "QB" ? 0.95
+             : (player.pos === "WR" || player.pos === "TE") ? 0.94
+             : 1.0;
+    }
+    if (temp < 32) wxMult *= 0.95; // freezing compounds wind penalty
+  } else if (weather?.isIndoor) {
+    // Dome boost for passing game
+    if (player.pos === "QB" || player.pos === "WR" || player.pos === "TE") wxMult = 1.03;
+  }
+
   // Base projection from 4 components
   const baseScore = volume * 0.40 + efficiency * 0.25 + trend * 0.20 + matchup * 0.15;
 
-  // Apply context and risk multipliers (clamp to 0–10)
-  const projection = fmt2(clamp(baseScore * contextMult * riskMult, 0, 10));
+  // Apply all multipliers (clamp to 0–10)
+  const projection = fmt2(clamp(baseScore * contextMult * riskMult * depthMult * wxMult, 0, 10));
 
   // Floor/ceiling
   const floor   = fmt2(clamp(baseScore * Math.min(contextMult, 1.0) * Math.max(riskMult - 0.10, 0.35), 0, projection));
@@ -302,26 +330,38 @@ export function projectPlayer(player, allStats, teamWins = null) {
     projection,
     floor,
     ceiling,
+    wxMult,
     hasData:    !!recentStats,
     recentYear,
     recentStats,
   };
 }
 
-// ── Rank all players ───────────────────────────────────────────────────────────
-export function rankPlayers(players, statsCache) {
-  return players
-    .map(p => projectPlayer(p, statsCache[p.id] ?? null))
-    .sort((a, b) => b.projection - a.projection);
-}
-
-// ── Enrich projected players with external draft rankings ─────────────────────
+// ── Normalize name for map lookup ─────────────────────────────────────────────
 function normalizeForLookup(name = "") {
   return name
     .toLowerCase()
     .replace(/\s+(jr\.?|sr\.?|ii|iii|iv)$/i, "")
     .replace(/[.']/g, "")
     .trim();
+}
+
+// ── Rank all players ───────────────────────────────────────────────────────────
+export function rankPlayers(players, statsCache, sleeperMap = null, weatherMap = null) {
+  return players
+    .map(p => {
+      // Kickers: Sleeper doesn't rank K, so default to starter (depthOrder=1)
+      let depthOrder = p.pos === "K" ? 1 : 2;
+      if (sleeperMap?.size) {
+        const nk = normalizeForLookup(p.nm);
+        depthOrder = sleeperMap.get(`${nk}|${p.pos}|${p.tm}`)?.depthOrder
+          ?? sleeperMap.get(`${nk}|${p.pos}`)?.depthOrder
+          ?? (p.pos === "K" ? 1 : 2);
+      }
+      const weather = weatherMap?.get(p.tm) ?? null;
+      return projectPlayer(p, statsCache[p.id] ?? null, null, depthOrder, weather);
+    })
+    .sort((a, b) => b.projection - a.projection);
 }
 
 export function enrichWithExternalRanks(projectedPlayers, sleeperMap, espnMap) {

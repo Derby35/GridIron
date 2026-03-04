@@ -12,7 +12,7 @@ const SITE = "https://site.api.espn.com/apis/site/v2/sports/football/nfl";
 const WEB = "https://site.web.api.espn.com/apis/common/v3/sports/football/nfl";
 const CORE = "https://sports.core.api.espn.com/v2/sports/football/leagues/nfl";
 const IMG = "https://a.espncdn.com/i/teamlogos/nfl/500";
-const HEAD = id => `https://a.espncdn.com/combiner/i?img=/i/headshots/nfl/players/full/${id}.png&w=350&h=254`;
+const HEAD = id => `https://a.espncdn.com/combiner/i?img=/i/headshots/nfl/players/full/${id}.png&w=500&h=362`;
 
 async function espn(url) {
   try { const r = await fetch(url); if (!r.ok) throw new Error(r.status); return r.json(); } catch(e) { console.warn("ESPN fetch failed:", url, e); return null; }
@@ -42,9 +42,15 @@ async function fetchAllRosters() {
         if (d?.athletes) {
           for (const group of d.athletes) {
             if (!group.items) continue;
+            // Skip practice squad and reserve groups
+            const gName = (group.displayName || group.name || "").toLowerCase();
+            if (gName.includes("practice") || gName.includes("reserve")) continue;
             for (const p of group.items) {
               const rawPos = p.position?.abbreviation;
               if (!OFF_POS.has(rawPos)) continue;
+              // Skip practice squad / reserve individual player status
+              const pStatus = (p.status?.name || p.status || "").toLowerCase();
+              if (pStatus.includes("practice squad") || pStatus.includes("reserve/")) continue;
               const pos = rawPos === "PK" ? "K" : rawPos; // normalize ESPN's "PK" → "K"
               players.push({
                 id: p.id,
@@ -55,6 +61,9 @@ async function fetchAllRosters() {
                 hs: p.headshot?.href || HEAD(p.id),
                 age: p.age,
                 exp: p.experience?.years,
+                ht: p.displayHeight || p.height || "",
+                wt: p.displayWeight || p.weight || "",
+                injuryStatus: p.injuries?.[0]?.status?.description || (typeof p.status === "string" && p.status !== "Active" ? p.status : "") || "",
               });
             }
           }
@@ -438,8 +447,8 @@ const StCard = ({l,v,c="var(--em)"}) => (
 );
 const TT = ({active,payload,label}) => {if(!active||!payload?.length)return null;return<div style={{background:'rgba(7,8,13,.97)',border:'1px solid rgba(0,196,255,.18)',borderRadius:10,padding:'9px 13px',fontSize:13,boxShadow:'0 8px 30px rgba(0,0,0,.6),0 0 0 1px rgba(0,196,255,.06)'}}><div style={{fontWeight:700,color:'var(--em)',marginBottom:4,fontFamily:"'Exo 2',sans-serif",letterSpacing:.5}}>{label}</div>{payload.map((p,i)=><div key={i} style={{display:'flex',gap:6,alignItems:'center',marginBottom:2}}><div style={{width:6,height:6,borderRadius:'50%',background:p.color||p.stroke,flexShrink:0}}/><span style={{color:'var(--dm)',fontFamily:"'Exo 2',sans-serif",fontSize:12}}>{p.name}:</span><span style={{fontWeight:700,fontFamily:"'Exo 2',sans-serif"}}>{typeof p.value==='number'?p.value.toLocaleString():p.value}</span></div>)}</div>};
 const Spinner = ({msg="Loading..."}) => <div style={{display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',padding:70,gap:14}}><div className="spin" style={{width:36,height:36,border:'3px solid rgba(0,196,255,.1)',borderTopColor:'var(--em)',borderRadius:'50%'}}/><span style={{color:'var(--dm)',fontSize:14,fontFamily:"'Outfit',sans-serif"}}>{msg}</span></div>;
-const th = {padding:'7px 8px',textAlign:'left',color:'var(--dm)',fontWeight:600,fontSize:11,textTransform:'uppercase',letterSpacing:.5,fontFamily:"'Exo 2',sans-serif"};
-const td = {padding:'7px 8px',textAlign:'left',fontSize:13};
+const th = {padding:'5px 8px',textAlign:'left',color:'var(--dm)',fontWeight:600,fontSize:11,textTransform:'uppercase',letterSpacing:.5,fontFamily:"'Exo 2',sans-serif"};
+const td = {padding:'4px 7px',textAlign:'left',fontSize:13};
 const posColor = p => p==="QB"?"var(--em)":p==="RB"?"var(--lm)":p==="WR"?"var(--sk)":p==="K"?"var(--kc)":"var(--vi)";
 
 // Depth label per position index (0-based)
@@ -453,9 +462,9 @@ const DEPTH_LABEL = {
 // ═══════════════════════════════════════════════════════════════
 //  SIDEBAR
 // ═══════════════════════════════════════════════════════════════
-const TABS = ["Home","Players","Teams","Games","Brackets","Predictions","Rankings","Edge Board"];
+const TABS = ["Home","Players","Teams","Games","Predictions","Rankings","Edge Board"];
 const MAIN_TABS = ["Home","Players","Teams","Games"];
-const ANALYSIS_TABS = ["Brackets","Predictions","Rankings","Edge Board"];
+const ANALYSIS_TABS = ["Predictions","Rankings","Edge Board"];
 
 const Sidebar = ({tab, go, goBack, canGoBack}) => {
   const navItem = t => {
@@ -531,29 +540,31 @@ const Sidebar = ({tab, go, goBack, canGoBack}) => {
 // ═══════════════════════════════════════════════════════════════
 //  HOME — Full-screen dashboard
 // ═══════════════════════════════════════════════════════════════
-const Home = ({go,goT,goP,players,loading,statsCache}) => {
+const Home = ({go,goT,goP,players,loading,statsCache,sleeperMap}) => {
   const[conf,setConf]=useState("AFC");
-  const[posTab,setPosTab]=useState("QB");
+  const[bsTab,setBsTab]=useState("fades");
 
-  // SB contenders: score from 2017-2024 bracket data (recency + win bonus)
-  const sbContenders=useMemo(()=>{
-    const scores={};
-    const yw={2017:1,2018:2,2019:3,2020:4,2021:5,2022:6,2023:7,2024:8};
-    for(const[yr,data] of Object.entries(BK)){
-      const w=yw[+yr]||1;
-      if(!data.sb) continue;
-      const{a,h,as:as2,hs:hs2}=data.sb;
-      scores[a]=(scores[a]||0)+w;
-      scores[h]=(scores[h]||0)+w;
-      const winner=as2>hs2?a:h;
-      scores[winner]=(scores[winner]||0)+5; // win bonus
-    }
-    const maxS=Math.max(...Object.values(scores));
-    return Object.entries(scores)
-      .map(([ab,sc])=>({ab,pct:Math.round(sc/maxS*100)}))
-      .sort((a,b)=>b.pct-a.pct)
-      .slice(0,8);
-  },[]);
+  // BS Detector: compare our 2024 production rank vs Sleeper consensus rank
+  const consensusCallout=useMemo(()=>{
+    if(!sleeperMap?.size) return {fades:[],gems:[]};
+    const ranked=[...players]
+      .filter(p=>(statsCache[p.id]?.[2024]?.fpts||0)>20)
+      .sort((a,b)=>(statsCache[b.id]?.[2024]?.fpts||0)-(statsCache[a.id]?.[2024]?.fpts||0));
+    const ourRankMap=new Map(ranked.map((p,i)=>[p.id,i+1]));
+    return ranked.map(p=>{
+      const nk=normalizeName(p.nm);
+      const sRank=sleeperMap.get(`${nk}|${p.pos}|${p.tm}`)?.rank
+                ??sleeperMap.get(`${nk}|${p.pos}`)?.rank??null;
+      if(!sRank) return null;
+      const ourRank=ourRankMap.get(p.id);
+      const diff=sRank-ourRank;
+      return {...p,sRank,ourRank,diff};
+    }).filter(Boolean).reduce((acc,p)=>{
+      if(p.diff>20) acc.gems.push(p);
+      else if(p.diff<-20) acc.fades.push(p);
+      return acc;
+    },{fades:[],gems:[]});
+  },[players,statsCache,sleeperMap]);
 
   // Teams grouped by conference + division
   const confDivs=useMemo(()=>{
@@ -566,34 +577,38 @@ const Home = ({go,goT,goP,players,loading,statsCache}) => {
     return divs;
   },[conf]);
 
-  // Trending players by position (sort by best fpts if statsCache available)
+  // Trending players — all positions combined, sorted by Sleeper search_rank (traction signal)
   const trending=useMemo(()=>{
-    let list=players.filter(p=>p.pos===posTab);
-    if(Object.keys(statsCache).length>10){
-      list=[...list].sort((a,b)=>{
-        const bA=Object.values(statsCache[a.id]||{}).reduce((m,s)=>Math.max(m,s.fpts||0),0);
-        const bB=Object.values(statsCache[b.id]||{}).reduce((m,s)=>Math.max(m,s.fpts||0),0);
-        return bB-bA;
-      });
-    }
-    return list.slice(0,8);
-  },[players,statsCache,posTab]);
-
-  // Recent SB champions (newest first)
-  const champs=Object.entries(BK)
-    .sort((a,b)=>+b[0]-+a[0]).slice(0,5)
-    .map(([yr,d])=>{
-      const won=d.sb.as>d.sb.hs?d.sb.a:d.sb.h;
-      const lost=d.sb.as>d.sb.hs?d.sb.h:d.sb.a;
-      return{yr,won,lost,score:`${Math.max(d.sb.as,d.sb.hs)}-${Math.min(d.sb.as,d.sb.hs)}`,mvp:d.sb.mvp};
+    const OFF = new Set(["QB","RB","WR","TE","K"]);
+    let list=players.filter(p=>OFF.has(p.pos));
+    const getSleeperRank = p => {
+      if(!sleeperMap?.size) return 99999;
+      const nk=normalizeName(p.nm);
+      return sleeperMap.get(`${nk}|${p.pos}|${p.tm}`)?.rank
+          ?? sleeperMap.get(`${nk}|${p.pos}`)?.rank
+          ?? 99999;
+    };
+    list=[...list].sort((a,b)=>{
+      const ra=getSleeperRank(a),rb=getSleeperRank(b);
+      if(ra!==rb) return ra-rb;
+      const bA=Object.values(statsCache[a.id]||{}).reduce((m,s)=>Math.max(m,s.fpts||0),0);
+      const bB=Object.values(statsCache[b.id]||{}).reduce((m,s)=>Math.max(m,s.fpts||0),0);
+      return bB-bA;
     });
+    return list.slice(0,12);
+  },[players,statsCache,sleeperMap]);
+
+  // Injury & Depth Watch
+  const injuryWatchList=useMemo(()=>
+    players.filter(p=>p.injuryStatus).slice(0,10)
+  ,[players]);
 
   return(
-    <div className="fu" style={{padding:'22px 24px',minHeight:'100vh'}}>
+    <div className="fu" style={{padding:'14px 18px',minHeight:'100vh'}}>
 
       {/* ── HERO ── */}
       <div style={{background:'linear-gradient(135deg,rgba(0,196,255,.07),rgba(255,186,0,.03),rgba(7,8,13,.9))',
-        border:'1px solid rgba(0,196,255,.12)',borderRadius:18,padding:'26px 30px',marginBottom:18}}>
+        border:'1px solid rgba(0,196,255,.12)',borderRadius:18,padding:'16px 22px',marginBottom:12}}>
         <div style={{display:'flex',alignItems:'flex-start',justifyContent:'space-between',gap:20}}>
           <div style={{flex:1}}>
             <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:10}}>
@@ -605,7 +620,7 @@ const Home = ({go,goT,goP,players,loading,statsCache}) => {
               NFL FANTASY<br/><span style={{color:'var(--em)'}}>INTELLIGENCE HUB</span>
             </h1>
             <p style={{color:'rgba(232,236,248,.45)',fontSize:13,lineHeight:1.65,maxWidth:460,marginBottom:16}}>
-              Real-time data from ESPN across all 32 NFL teams. Career stats, projections, draft rankings, and market inefficiency scores.
+              We rank all 700+ active NFL skill players using real 2024 production data. See exactly where <span style={{color:'rgba(232,236,248,.75)',fontWeight:600}}>Sleeper and ESPN</span> are overrating and underrating players — updated live.
             </p>
             <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
               {["Players","Teams","Rankings","Edge Board"].map((t,i)=>(
@@ -615,6 +630,12 @@ const Home = ({go,goT,goP,players,loading,statsCache}) => {
                   color:i===0?'#000':'rgba(232,236,248,.8)',fontWeight:700,fontSize:13,cursor:'pointer',
                   boxShadow:i===0?'0 0 16px rgba(0,196,255,.3)':'none'}}>{t}</button>
               ))}
+              <button onClick={()=>go("Rankings")} title="Players the market overrates — we rank lower" style={{padding:'9px 20px',borderRadius:9,
+                border:'1px solid rgba(248,113,113,.35)',background:'rgba(248,113,113,.08)',
+                color:'#f87171',fontWeight:700,fontSize:13,cursor:'pointer'}}>FADES ▼</button>
+              <button onClick={()=>go("Rankings")} title="Players the market underrates — we rank higher" style={{padding:'9px 20px',borderRadius:9,
+                border:'1px solid rgba(74,222,128,.35)',background:'rgba(74,222,128,.08)',
+                color:'#4ade80',fontWeight:700,fontSize:13,cursor:'pointer'}}>GEMS ▲</button>
             </div>
           </div>
           {/* Right: big count + pos breakdown */}
@@ -639,55 +660,53 @@ const Home = ({go,goT,goP,players,loading,statsCache}) => {
         </div>
       </div>
 
-      {/* ── MAIN 2-COL: Trending Players + SB Contenders ── */}
-      <div style={{display:'grid',gridTemplateColumns:'1fr 300px',gap:16,marginBottom:16}}>
+      {/* ── MAIN 2-COL: Trending Players + BS Detector ── */}
+      <div style={{display:'grid',gridTemplateColumns:'1fr 300px',gap:12,marginBottom:12}}>
 
         {/* TRENDING PLAYERS */}
-        <div style={{background:'rgba(8,12,10,.70)',backdropFilter:'blur(8px)',WebkitBackdropFilter:'blur(8px)',border:'1px solid var(--bd)',borderRadius:16,padding:18}}>
+        <div style={{background:'rgba(8,12,10,.70)',backdropFilter:'blur(8px)',WebkitBackdropFilter:'blur(8px)',border:'1px solid var(--bd)',borderRadius:16,padding:16}}>
           <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:14}}>
             <div style={{fontFamily:"'Bebas Neue'",fontSize:18,letterSpacing:1}}>TRENDING PLAYERS</div>
-            <div style={{display:'flex',gap:4}}>
-              {["QB","RB","WR","TE","K"].map(p=>(
-                <button key={p} onClick={()=>setPosTab(p)} style={{padding:'4px 10px',borderRadius:6,border:'none',
-                  background:posTab===p?posColor(p):'rgba(255,255,255,.06)',
-                  color:posTab===p?'#000':'rgba(232,236,248,.55)',
-                  fontWeight:posTab===p?800:500,fontSize:12,cursor:'pointer'}}>{p}</button>
-              ))}
-            </div>
+            <div style={{color:'rgba(0,196,255,.35)',fontSize:10,fontFamily:"'Exo 2',sans-serif",letterSpacing:1,textTransform:'uppercase'}}>Popularity · All Positions</div>
           </div>
           {loading ? <Spinner msg="Loading roster…"/> : (
-            <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:10}}>
+            <div style={{display:'grid',gridTemplateColumns:'repeat(6,1fr)',gap:10}}>
               {trending.map(p=>{
                 const bestFpts=statsCache[p.id]?Object.values(statsCache[p.id]).reduce((m,s)=>Math.max(m,s.fpts||0),0):0;
                 const tc=TM[p.tm]?.c1||'#00C4FF';
+                const sleeperRank=sleeperMap?.size ? (sleeperMap.get(`${normalizeName(p.nm)}|${p.pos}|${p.tm}`)?.rank ?? sleeperMap.get(`${normalizeName(p.nm)}|${p.pos}`)?.rank ?? 99999) : 99999;
                 return(
                   <div key={p.id} onClick={()=>goP(p.id)}
                     style={{background:`linear-gradient(150deg,${tc}20,${tc}08,rgba(18,19,32,.9))`,
                       border:`1px solid ${tc}28`,borderTop:`3px solid ${tc}`,
-                      borderRadius:12,padding:'12px 10px',textAlign:'center',
+                      borderRadius:12,padding:'10px 8px',textAlign:'center',
                       cursor:'pointer',transition:'all .2s',
                       position:'relative',overflow:'hidden'}}
                     onMouseEnter={e=>{e.currentTarget.style.transform='translateY(-3px)';e.currentTarget.style.boxShadow=`0 8px 30px ${tc}35`;}}
                     onMouseLeave={e=>{e.currentTarget.style.transform='none';e.currentTarget.style.boxShadow='none';}}>
                     {/* Jersey number watermark */}
                     {p.n && <div style={{position:'absolute',top:'50%',left:'50%',transform:'translate(-50%,-50%)',
-                      fontFamily:"'Bebas Neue'",fontSize:80,color:tc,opacity:.08,lineHeight:1,
+                      fontFamily:"'Bebas Neue'",fontSize:70,color:tc,opacity:.08,lineHeight:1,
                       userSelect:'none',pointerEvents:'none',letterSpacing:-2,whiteSpace:'nowrap'}}>{p.n}</div>}
                     {/* Position badge top-left */}
-                    <div style={{position:'absolute',top:7,left:8,background:`${posColor(p.pos)}20`,
+                    <div style={{position:'absolute',top:6,left:7,background:`${posColor(p.pos)}20`,
                       border:`1px solid ${posColor(p.pos)}50`,color:posColor(p.pos),fontSize:9,fontWeight:700,
-                      fontFamily:"'Exo 2',sans-serif",letterSpacing:.8,padding:'2px 6px',borderRadius:4}}>{p.pos}</div>
+                      fontFamily:"'Exo 2',sans-serif",letterSpacing:.8,padding:'2px 5px',borderRadius:4}}>{p.pos}</div>
+                    {/* TRENDING chip */}
+                    {sleeperRank<30 && <div style={{position:'absolute',top:6,right:7,background:'rgba(255,186,0,.15)',
+                      border:'1px solid rgba(255,186,0,.4)',color:'var(--gd)',fontSize:8,fontWeight:700,
+                      fontFamily:"'Exo 2',sans-serif",letterSpacing:.6,padding:'2px 5px',borderRadius:4}}>HOT</div>}
                     {/* Headshot with team glow ring */}
                     <div style={{display:'inline-block',borderRadius:'50%',boxShadow:`0 0 0 2px ${tc}40`,marginTop:4,marginBottom:2}}>
-                      <Hs src={p.hs} sz={46}/>
+                      <Hs src={p.hs} sz={42}/>
                     </div>
-                    <div style={{fontWeight:700,fontSize:12,marginTop:5,lineHeight:1.2,
+                    <div style={{fontWeight:700,fontSize:11,marginTop:4,lineHeight:1.2,
                       overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',position:'relative'}}>{p.nm}</div>
-                    <div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:4,marginTop:4,position:'relative'}}>
-                      <Logo ab={p.tm} sz={14}/>
+                    <div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:4,marginTop:3,position:'relative'}}>
+                      <Logo ab={p.tm} sz={12}/>
                       <span style={{color:'rgba(232,236,248,.5)',fontSize:10}}>{p.tm}</span>
                     </div>
-                    {bestFpts>0 && <div style={{color:'var(--gd)',fontSize:10,fontWeight:700,marginTop:4,position:'relative'}}>{bestFpts} fpts</div>}
+                    {bestFpts>0 && <div style={{color:'var(--gd)',fontSize:10,fontWeight:700,marginTop:3,position:'relative'}}>{bestFpts} <span style={{opacity:.6,fontWeight:400}}>pts '24</span></div>}
                   </div>
                 );
               })}
@@ -695,22 +714,55 @@ const Home = ({go,goT,goP,players,loading,statsCache}) => {
           )}
         </div>
 
-        {/* SB CONTENDERS */}
-        <div style={{background:'rgba(8,12,10,.70)',backdropFilter:'blur(8px)',WebkitBackdropFilter:'blur(8px)',border:'1px solid var(--bd)',borderRadius:16,padding:18}}>
-          <div style={{fontFamily:"'Bebas Neue'",fontSize:18,letterSpacing:1,marginBottom:3}}>SB CONTENDERS</div>
-          <div style={{color:'rgba(0,196,255,.3)',fontSize:10,textTransform:'uppercase',letterSpacing:.8,marginBottom:14,fontFamily:"'Exo 2',sans-serif"}}>2017–2024 Playoff History</div>
-          {sbContenders.map(({ab,pct})=>(
-            <div key={ab} onClick={()=>goT(ab)} style={{marginBottom:10,cursor:'pointer'}}>
-              <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:3}}>
-                <div style={{display:'flex',alignItems:'center',gap:6}}>
-                  <Logo ab={ab} sz={18}/>
-                  <span style={{fontSize:12,fontWeight:600}}>{ab}</span>
-                  <span style={{color:'rgba(232,236,248,.35)',fontSize:10}}>{TM[ab]?.n}</span>
+        {/* BS DETECTOR */}
+        <div style={{background:'rgba(8,12,10,.70)',backdropFilter:'blur(8px)',WebkitBackdropFilter:'blur(8px)',border:'1px solid var(--bd)',borderRadius:16,padding:16}}>
+          <div style={{fontFamily:"'Bebas Neue'",fontSize:18,letterSpacing:1,marginBottom:2}}>BS DETECTOR</div>
+          <div style={{color:'rgba(0,196,255,.3)',fontSize:10,textTransform:'uppercase',letterSpacing:.8,marginBottom:10,fontFamily:"'Exo 2',sans-serif"}}>Sleeper vs Reality · 2024 Data</div>
+          {/* Tabs */}
+          <div style={{display:'flex',gap:4,marginBottom:12}}>
+            {[["fades","FADES","rgba(248,113,113,.9)"],["gems","GEMS","rgba(74,222,128,.9)"]].map(([id,label,c])=>(
+              <button key={id} onClick={()=>setBsTab(id)} style={{flex:1,padding:'5px 0',borderRadius:7,border:'none',
+                background:bsTab===id?`${c}20`:'rgba(255,255,255,.05)',
+                color:bsTab===id?c:'rgba(232,236,248,.35)',
+                fontWeight:700,fontSize:11,cursor:'pointer',letterSpacing:.8,
+                outline:bsTab===id?`1px solid ${c}40`:'none',fontFamily:"'Exo 2',sans-serif",textTransform:'uppercase'}}>
+                {bsTab===id&&(id==='fades'?'▼ ':'▲ ')}{label}
+              </button>
+            ))}
+          </div>
+          {/* Player list */}
+          {!sleeperMap?.size ? (
+            <div style={{color:'rgba(232,236,248,.3)',fontSize:11,textAlign:'center',padding:'20px 0'}}>Loading consensus data…</div>
+          ) : (consensusCallout[bsTab]||[]).length===0 ? (
+            <div style={{color:'rgba(232,236,248,.3)',fontSize:11,textAlign:'center',padding:'20px 0'}}>No strong {bsTab} found yet</div>
+          ) : (consensusCallout[bsTab]||[]).slice(0,8).map((p,i)=>(
+            <div key={p.id} onClick={()=>goP(p.id)} style={{display:'flex',alignItems:'center',gap:8,padding:'7px 0',
+              borderBottom:i<7?'1px solid rgba(255,255,255,.04)':'none',cursor:'pointer'}}>
+              <div style={{background:`${posColor(p.pos)}20`,border:`1px solid ${posColor(p.pos)}50`,
+                color:posColor(p.pos),fontSize:9,fontWeight:700,fontFamily:"'Exo 2',sans-serif",
+                letterSpacing:.7,padding:'2px 5px',borderRadius:4,flexShrink:0}}>{p.pos}</div>
+              <div style={{flex:1,overflow:'hidden'}}>
+                <div style={{fontSize:12,fontWeight:700,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{p.nm}</div>
+                <div style={{display:'flex',alignItems:'center',gap:4,marginTop:1}}>
+                  <Logo ab={p.tm} sz={10}/>
+                  <span style={{color:'rgba(232,236,248,.35)',fontSize:10}}>{p.tm}</span>
                 </div>
-                <span style={{fontFamily:"'Bebas Neue'",fontSize:14,color:'var(--em)'}}>{pct}%</span>
               </div>
-              <div style={{background:'rgba(0,196,255,.06)',borderRadius:4,height:4}}>
-                <div style={{width:`${pct}%`,height:'100%',background:TM[ab]?.c1||'var(--em)',borderRadius:4,transition:'width .5s'}}/>
+              <div style={{textAlign:'right',flexShrink:0}}>
+                <div style={{display:'flex',gap:6,alignItems:'center'}}>
+                  <div style={{textAlign:'center'}}>
+                    <div style={{fontFamily:"'Bebas Neue'",fontSize:13,color:'var(--gd)',lineHeight:1}}>#{p.ourRank}</div>
+                    <div style={{color:'rgba(232,236,248,.3)',fontSize:8,letterSpacing:.5}}>OURS</div>
+                  </div>
+                  <div style={{color:'rgba(255,255,255,.15)',fontSize:10}}>vs</div>
+                  <div style={{textAlign:'center'}}>
+                    <div style={{fontFamily:"'Bebas Neue'",fontSize:13,color:'rgba(168,85,247,.9)',lineHeight:1}}>#{p.sRank}</div>
+                    <div style={{color:'rgba(232,236,248,.3)',fontSize:8,letterSpacing:.5}}>SLP</div>
+                  </div>
+                  <div style={{fontFamily:"'Bebas Neue'",fontSize:14,color:bsTab==='gems'?'#4ade80':'#f87171',fontWeight:700,minWidth:28,textAlign:'right'}}>
+                    {bsTab==='gems'?'▲':'▼'}{Math.abs(p.diff)}
+                  </div>
+                </div>
               </div>
             </div>
           ))}
@@ -718,7 +770,7 @@ const Home = ({go,goT,goP,players,loading,statsCache}) => {
       </div>
 
       {/* ── TEAM GRID BY CONFERENCE ── */}
-      <div style={{background:'rgba(8,12,10,.70)',backdropFilter:'blur(8px)',WebkitBackdropFilter:'blur(8px)',border:'1px solid var(--bd)',borderRadius:16,padding:18,marginBottom:16}}>
+      <div style={{background:'rgba(8,12,10,.70)',backdropFilter:'blur(8px)',WebkitBackdropFilter:'blur(8px)',border:'1px solid var(--bd)',borderRadius:16,padding:16,marginBottom:12}}>
         <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:14}}>
           <div style={{fontFamily:"'Bebas Neue'",fontSize:18,letterSpacing:1}}>TEAMS BY DIVISION</div>
           <div style={{display:'flex',gap:4}}>
@@ -761,25 +813,42 @@ const Home = ({go,goT,goP,players,loading,statsCache}) => {
         </div>
       </div>
 
-      {/* ── RECENT SB CHAMPIONS ── */}
-      <div style={{background:'rgba(8,12,10,.70)',backdropFilter:'blur(8px)',WebkitBackdropFilter:'blur(8px)',border:'1px solid var(--bd)',borderRadius:16,padding:18}}>
-        <div style={{fontFamily:"'Bebas Neue'",fontSize:18,letterSpacing:1,marginBottom:14}}>RECENT SUPER BOWL CHAMPIONS</div>
-        <div style={{display:'grid',gridTemplateColumns:'repeat(5,1fr)',gap:10}}>
-          {champs.map(({yr,won,lost,score,mvp})=>(
-            <div key={yr} onClick={()=>goT(won)}
-              style={{background:'var(--s2)',border:`1px solid ${TM[won]?.c1||'var(--bd)'}33`,
-                borderRadius:12,padding:'14px 12px',cursor:'pointer',transition:'all .15s'}}
-              onMouseEnter={e=>{e.currentTarget.style.transform='translateY(-2px)';e.currentTarget.style.borderColor=TM[won]?.c1+'88'}}
-              onMouseLeave={e=>{e.currentTarget.style.transform='none';e.currentTarget.style.borderColor=`${TM[won]?.c1||'var(--bd)'}33`}}>
-              <div style={{color:'rgba(232,236,248,.3)',fontSize:10,textTransform:'uppercase',letterSpacing:1,marginBottom:8}}>SB {yr}</div>
-              <Logo ab={won} sz={38}/>
-              <div style={{fontFamily:"'Bebas Neue'",fontSize:20,letterSpacing:1,marginTop:7}}>{won}</div>
-              <div style={{color:'var(--gd)',fontWeight:700,fontSize:14}}>{score}</div>
-              <div style={{color:'rgba(232,236,248,.35)',fontSize:10,marginTop:2}}>def. {lost}</div>
-              <div style={{color:'rgba(232,236,248,.25)',fontSize:9,marginTop:4}}>MVP: {mvp}</div>
-            </div>
-          ))}
-        </div>
+      {/* ── INJURY & DEPTH WATCH ── */}
+      <div style={{background:'rgba(8,12,10,.70)',backdropFilter:'blur(8px)',WebkitBackdropFilter:'blur(8px)',border:'1px solid var(--bd)',borderRadius:16,padding:16}}>
+        <div style={{fontFamily:"'Bebas Neue'",fontSize:18,letterSpacing:1,marginBottom:14}}>INJURY &amp; DEPTH WATCH</div>
+        {injuryWatchList.length===0 ? (
+          <div style={{color:'rgba(232,236,248,.3)',fontSize:13,fontFamily:"'Exo 2',sans-serif",padding:'10px 0'}}>No injury designations available</div>
+        ) : (
+          <div style={{display:'flex',gap:10,overflowX:'auto',paddingBottom:10}}>
+            {injuryWatchList.map(p=>{
+              const status=(p.injuryStatus||"").toLowerCase();
+              const sc=status.includes("out")||status.includes("ir")?"#ef4444":status.includes("doubtful")?"#f97316":"#eab308";
+              return(
+                <div key={p.id} onClick={()=>goP(p.id)}
+                  style={{background:'var(--s2)',border:`1px solid ${sc}30`,borderRadius:10,
+                    padding:'10px 12px',flexShrink:0,minWidth:150,cursor:'pointer',transition:'all .15s'}}
+                  onMouseEnter={e=>{e.currentTarget.style.borderColor=`${sc}60`}}
+                  onMouseLeave={e=>{e.currentTarget.style.borderColor=`${sc}30`}}>
+                  <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:6}}>
+                    <Hs src={p.hs} sz={34}/>
+                    <div>
+                      <div style={{fontWeight:700,fontSize:12,lineHeight:1.2}}>{p.nm}</div>
+                      <div style={{display:'flex',alignItems:'center',gap:4,marginTop:2}}>
+                        <Logo ab={p.tm} sz={12}/>
+                        <span style={{color:'rgba(232,236,248,.4)',fontSize:10}}>{p.pos}</span>
+                      </div>
+                    </div>
+                  </div>
+                  <div style={{background:`${sc}18`,border:`1px solid ${sc}40`,color:sc,
+                    fontSize:10,fontWeight:700,padding:'2px 8px',borderRadius:4,
+                    fontFamily:"'Exo 2',sans-serif",letterSpacing:.6,display:'inline-block'}}>
+                    {p.injuryStatus}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
 
       {loading && <div style={{marginTop:16}}><Spinner msg="Fetching all 32 team rosters from ESPN…"/></div>}
@@ -869,7 +938,7 @@ const Players = ({players,loading,sel,setSel,goT,statsCache,setStatsCache}) => {
       .sort((a, b) => b.avg - a.avg);
   }, [gameLog]);
 
-  return <div className="fu" style={{padding:'24px 24px'}}>
+  return <div className="fu" style={{padding:'16px 20px'}}>
     <div style={{display:'grid',gridTemplateColumns:'320px 1fr',gap:18,minHeight:'calc(100vh - 110px)'}}>
       {/* SIDEBAR */}
       <div>
@@ -933,7 +1002,7 @@ const Players = ({players,loading,sel,setSel,goT,statsCache,setStatsCache}) => {
                 <div style={{display:'flex',alignItems:'center',gap:8,marginTop:5}}>
                   <Pil ch={pl.pos} c={posColor(pl.pos)} s={{fontSize:12,padding:'4px 12px'}}/>
                   <span style={{cursor:'pointer',color:'var(--dm)',fontSize:14,textDecoration:'underline'}} onClick={()=>goT(pl.tm)}>{TM[pl.tm]?.c} {TM[pl.tm]?.n}</span>
-                  <span style={{color:'var(--dm)',fontSize:14}}>#{pl.n}{pl.age?` • Age ${pl.age}`:""}{pl.exp?` • ${pl.exp}yr exp`:""}</span>
+                  <span style={{color:'var(--dm)',fontSize:14}}>#{pl.n}{pl.age?` • Age ${pl.age}`:""}{pl.exp?` • ${pl.exp}yr exp`:""}{pl.ht?` • ${pl.ht}`:""}{pl.wt?` • ${pl.wt} lbs`:""}</span>
                 </div>
               </div>
               <Logo ab={pl.tm} sz={50}/>
@@ -1157,7 +1226,7 @@ const Teams = ({sel,setSel,players,goP,statsCache,sleeperMap}) => {
   const hasOfficialChart = Object.keys(depthChart).length > 0;
   const hasSleeperChart = sleeperMap?.size > 0;
 
-  return <div className="fu" style={{padding:'24px 24px'}}><div style={{display:'grid',gridTemplateColumns:'280px 1fr',gap:18}}>
+  return <div className="fu" style={{padding:'16px 20px'}}><div style={{display:'grid',gridTemplateColumns:'280px 1fr',gap:18}}>
     <div>
       <div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:14,padding:12,marginBottom:10}}><div style={{display:'flex',gap:4}}>{["ALL","AFC","NFC"].map(c=><button key={c} onClick={()=>setConf(c)} style={{flex:1,padding:'6px',borderRadius:7,border:'none',background:conf===c?'var(--em)':'rgba(255,255,255,.05)',color:conf===c?'#000':'var(--tx)',fontWeight:conf===c?800:500,fontSize:13,cursor:'pointer'}}>{c}</button>)}</div></div>
       <div style={{maxHeight:'calc(100vh - 200px)',overflowY:'auto',display:'flex',flexDirection:'column',gap:4}}>
@@ -1203,9 +1272,9 @@ const Teams = ({sel,setSel,players,goP,statsCache,sleeperMap}) => {
                   <div style={{borderRadius:'50%',boxShadow:`0 0 0 2px ${t.c1}35`,flexShrink:0}}>
                     <Hs src={p.hs} sz={38}/>
                   </div>
-                  <div>
-                    <div style={{fontWeight:700,fontSize:14}}>{p.nm}</div>
-                    <div style={{color:'var(--dm)',fontSize:12}}>#{p.n}{p.age?` • ${p.age}yr`:""}{p.exp!=null?` • ${p.exp}yr exp`:""}</div>
+                  <div style={{minWidth:0}}>
+                    <div style={{fontWeight:700,fontSize:14,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{p.nm}</div>
+                    <div style={{color:'var(--dm)',fontSize:12,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>#{p.n}{p.age?` • ${p.age}yr`:""}{p.exp!=null?` • ${p.exp}yr exp`:""}</div>
                   </div>
                 </div>;
               })}
@@ -1245,7 +1314,7 @@ const GamesFetch = ({goT}) => {
     return "🌤️";
   };
 
-  return <div className="fu" style={{padding:'24px 24px'}}>
+  return <div className="fu" style={{padding:'16px 20px'}}>
     <div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:14,padding:16,marginBottom:16}}>
       <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',flexWrap:'wrap',gap:10}}>
         <h2 style={{fontFamily:"'Bebas Neue'",fontSize:24,letterSpacing:1}}>GAME DATABASE <Pil ch="LIVE ESPN API" c="var(--lm)" s={{marginLeft:10,fontSize:11}}/></h2>
@@ -1302,9 +1371,9 @@ const GamesFetch = ({goT}) => {
           <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',flexWrap:'wrap',gap:8,marginTop:8}}>
             {c.venue && <div style={{color:'var(--dm)',fontSize:12}}>📍 {c.venue.fullName}{c.venue.indoor?' • Indoor':''}</div>}
             {wx && <div style={{display:'flex',alignItems:'center',gap:10,flexWrap:'wrap'}}>
-              {wxCond && <span style={{color:'var(--sk)',fontSize:12,fontWeight:600}}>{wxIcon(wxCond)} {wxCond}</span>}
+              {wxCond && <span style={{color:'var(--sk)',fontSize:12,fontWeight:600,fontFamily:"'Segoe UI Emoji','Apple Color Emoji',sans-serif"}}>{wxIcon(wxCond)} {wxCond}</span>}
               {wxTemp && <span style={{color:'var(--tx)',fontSize:12}}>{wxTemp}</span>}
-              {wxWind && <span style={{color:'var(--dm)',fontSize:12}}>💨 {wxWind}{wxGust?` (${wxGust})`:''}</span>}
+              {wxWind && <span style={{color:'var(--dm)',fontSize:12,fontFamily:"'Segoe UI Emoji','Apple Color Emoji',sans-serif"}}>💨 {wxWind}{wxGust?` (${wxGust})`:''}</span>}
               {wxHumid && <span style={{color:'var(--dm)',fontSize:12}}>{wxHumid}</span>}
             </div>}
             {!wx && c.venue && !c.venue.indoor && <span style={{color:'var(--dm)',fontSize:11,fontStyle:'italic'}}>Weather unavailable</span>}
@@ -1347,7 +1416,7 @@ const BG = ({a,h,as,hs,goT}) => (
 const Brackets = ({goT}) => {
   const[yr,setYr]=useState(2024);const b=BK[yr];if(!b)return null;
   const rn = r=>r==="WC"?"Wild Card":r==="DIV"?"Divisional":"Championship";
-  return <div className="fu" style={{padding:'24px 24px'}}>
+  return <div className="fu" style={{padding:'16px 20px'}}>
     <div style={{background:'var(--s1)',border:'1px solid var(--bd)',borderRadius:14,padding:16,marginBottom:16}}>
       <h2 style={{fontFamily:"'Bebas Neue'",fontSize:24,letterSpacing:1,marginBottom:10}}>PLAYOFF BRACKETS</h2>
       <div style={{display:'flex',gap:4,flexWrap:'wrap'}}>{Object.keys(BK).sort((a,b)=>+b-+a).map(y=><button key={y} onClick={()=>setYr(+y)} style={{padding:'6px 14px',borderRadius:7,border:'none',background:yr===+y?'var(--em)':'rgba(255,255,255,.05)',color:yr===+y?'#000':'var(--tx)',fontWeight:yr===+y?800:500,fontSize:14,cursor:'pointer'}}>{y}</button>)}</div>
@@ -1373,6 +1442,23 @@ const Brackets = ({goT}) => {
       ))}
     </div>
   </div>;
+};
+
+const GamesAndBrackets = ({goT}) => {
+  const[sub,setSub]=useState("SCOREBOARD");
+  return(
+    <>
+      <div style={{display:'flex',gap:4,padding:'14px 20px 0'}}>
+        {["SCOREBOARD","PLAYOFF BRACKETS"].map(s=>(
+          <button key={s} onClick={()=>setSub(s)} style={{padding:'6px 16px',borderRadius:7,border:'none',
+            background:sub===s?'var(--em)':'rgba(255,255,255,.06)',
+            color:sub===s?'#000':'rgba(232,236,248,.55)',
+            fontWeight:700,fontSize:13,cursor:'pointer'}}>{s}</button>
+        ))}
+      </div>
+      {sub==="SCOREBOARD" ? <GamesFetch goT={goT}/> : <Brackets goT={goT}/>}
+    </>
+  );
 };
 
 // ═══════════════════════════════════════════════════════════════
@@ -1604,10 +1690,10 @@ const Predictions = ({goT, players, statsCache, setStatsCache}) => {
     </div>
   );
 
-  return <div className="fu" style={{padding:'24px 24px'}}>
+  return <div className="fu" style={{padding:'16px 20px'}}>
 
     {/* Header */}
-    <div style={{background:'var(--s1)', border:'1px solid var(--bd)', borderRadius:14, padding:18, marginBottom:16}}>
+    <div style={{background:'var(--s1)', border:'1px solid var(--bd)', borderRadius:14, padding:14, marginBottom:10}}>
       <div style={{display:'flex', alignItems:'flex-start', justifyContent:'space-between', flexWrap:'wrap', gap:12}}>
         <div>
           <h2 style={{fontFamily:"'Bebas Neue'", fontSize:26, letterSpacing:1, marginBottom:5}}>NFL WIN PROJECTIONS</h2>
@@ -2080,7 +2166,7 @@ const EdgeBoard = ({ players, statsCache, setStatsCache, goP, sleeperMap, espnMa
 // ═══════════════════════════════════════════════════════════════
 const SCORE_COLORS = { volume:'var(--em)', efficiency:'var(--sk)', trend:'var(--lm)', matchup:'var(--vi)' };
 
-const Rankings = ({players, statsCache, setStatsCache, goT, goP, sleeperMap, espnMap, extLoading}) => {
+const Rankings = ({players, statsCache, setStatsCache, goT, goP, sleeperMap, espnMap, extLoading, weatherMap}) => {
   const [q,           setQ]           = useState("");
   const [posFilter,   setPosFilter]   = useState("ALL");
   const [sortKey,     setSortKey]     = useState("pts2024");
@@ -2098,8 +2184,8 @@ const Rankings = ({players, statsCache, setStatsCache, goT, goP, sleeperMap, esp
     let done = 0;
     const total = needed.length;
     (async () => {
-      for (let i = 0; i < needed.length; i += 20) {
-        await Promise.allSettled(needed.slice(i, i + 20).map(p =>
+      for (let i = 0; i < needed.length; i += 50) {
+        await Promise.allSettled(needed.slice(i, i + 50).map(p =>
           fetchPlayerStats(p.id).then(data => {
             setStatsCache(prev => ({...prev, [p.id]: data || {}}));
             done++;
@@ -2113,7 +2199,7 @@ const Rankings = ({players, statsCache, setStatsCache, goT, goP, sleeperMap, esp
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [players, fetchDone]);
 
-  const ranked = useMemo(() => rankPlayers(players, statsCache), [players, statsCache]);
+  const ranked = useMemo(() => rankPlayers(players, statsCache, sleeperMap, weatherMap), [players, statsCache, sleeperMap, weatherMap]);
 
   // Attach .sleeperRank and .espnRank to every projected player
   const enriched = useMemo(
@@ -2147,6 +2233,12 @@ const Rankings = ({players, statsCache, setStatsCache, goT, goP, sleeperMap, esp
 
   const displayed = useMemo(() => {
     let list = posFilter === "ALL" ? withPts : withPts.filter(p => p.pos === posFilter);
+    // Show rookies/2nd-yr players always; hide ghost players (veterans with no recent games)
+    list = list.filter(p => {
+      const isRookie = p.exp == null || p.exp <= 1;
+      if (isRookie) return true;
+      return [2024, 2023, 2022].some(yr => (statsCache[p.id]?.[yr]?.gp || 0) >= 2);
+    });
     if (q) {
       const lq = q.toLowerCase();
       list = list.filter(p => p.nm.toLowerCase().includes(lq) || p.tm.toLowerCase().includes(lq));
@@ -2157,13 +2249,12 @@ const Rankings = ({players, statsCache, setStatsCache, goT, goP, sleeperMap, esp
       volume:      (a,b) => b.volume - a.volume,
       efficiency:  (a,b) => b.efficiency - a.efficiency,
       trend:       (a,b) => b.trend - a.trend,
-      matchup:     (a,b) => b.matchup - a.matchup,
       // External ranks: lower number = better draft position → sort ascending; nulls last
       sleeperRank: (a,b) => (a.sleeperRank || 9999) - (b.sleeperRank || 9999),
       espnRank:    (a,b) => (a.espnRank    || 9999) - (b.espnRank    || 9999),
     };
     return [...list].sort(fns[sortKey] || fns.pts2024);
-  }, [withPts, posFilter, q, sortKey]);
+  }, [withPts, posFilter, q, sortKey, statsCache]);
 
   const MiniBar = ({val, color}) => (
     <div style={{display:'flex', alignItems:'center', gap:5}}>
@@ -2176,21 +2267,23 @@ const Rankings = ({players, statsCache, setStatsCache, goT, goP, sleeperMap, esp
 
   const projColor = v => v >= 7 ? 'var(--lm)' : v >= 5 ? 'var(--gd)' : v >= 3 ? 'var(--em)' : 'var(--rs)';
 
-  return <div className="fu" style={{padding:'24px 24px'}}>
+  return <div className="fu" style={{padding:'16px 20px'}}>
 
     {/* ── Header ── */}
-    <div style={{background:'var(--s1)', border:'1px solid var(--bd)', borderRadius:14, padding:18, marginBottom:16}}>
+    <div style={{background:'var(--s1)', border:'1px solid var(--bd)', borderRadius:14, padding:14, marginBottom:10}}>
       <div style={{display:'flex', alignItems:'flex-start', justifyContent:'space-between', flexWrap:'wrap', gap:12, marginBottom:12}}>
         <div>
           <h2 style={{fontFamily:"'Bebas Neue'", fontSize:28, letterSpacing:1.5, marginBottom:4}}>
-            2024 PPR RANKINGS
+            CONSENSUS CALLOUT — 2024 RANKINGS
           </h2>
           <p style={{color:'var(--dm)', fontSize:13, lineHeight:1.7}}>
             <span style={{color:'var(--gd)', fontWeight:700}}>2024 Actual PPR Points</span>
             <span style={{color:'var(--dm)'}}> · </span>
-            <span style={{color:'var(--em)', fontWeight:700}}>WR1/WR2/RB1</span>
-            <span style={{color:'var(--dm)'}}> position class within group · </span>
-            <span style={{color:'var(--dm)', fontSize:11}}>click any row for projection breakdown</span>
+            <span style={{color:'#4ade80', fontWeight:700}}>▲ Hidden gem</span>
+            <span style={{color:'var(--dm)'}}> or </span>
+            <span style={{color:'#f87171', fontWeight:700}}>▼ Fade</span>
+            <span style={{color:'var(--dm)'}}> vs Sleeper/ESPN consensus · </span>
+            <span style={{color:'var(--dm)', fontSize:11}}>click any row for breakdown</span>
           </p>
         </div>
         {/* Position filter */}
@@ -2211,7 +2304,7 @@ const Rankings = ({players, statsCache, setStatsCache, goT, goP, sleeperMap, esp
           style={{flex:1, minWidth:180, padding:'9px 13px', borderRadius:9, border:'1px solid var(--bd)',
                   background:'rgba(0,0,0,.3)', color:'var(--tx)', outline:'none', fontSize:13}}/>
         <div style={{display:'flex', gap:4, flexWrap:'wrap'}}>
-          {[['pts2024','2024 PPR Pts'],['projection','Projection'],['volume','Volume'],['efficiency','Efficiency'],['trend','Trend'],['matchup','Matchup'],['sleeperRank','Sleeper ADP'],['espnRank','ESPN ADP']].map(([k,l]) => (
+          {[['pts2024','2024 PPR Pts'],['projection','Projection'],['volume','Volume'],['efficiency','Efficiency'],['trend','Trend'],['sleeperRank','Sleeper ADP'],['espnRank','ESPN ADP']].map(([k,l]) => (
             <button key={k} onClick={() => setSortKey(k)} style={{
               padding:'5px 12px', borderRadius:7, border:'none', cursor:'pointer', fontSize:12, whiteSpace:'nowrap',
               background: sortKey===k ? (k==='pts2024'?'var(--gd)':k==='sleeperRank'?'#C084FC':k==='espnRank'?'#FF3D5A':'var(--em)') : 'rgba(255,255,255,.05)',
@@ -2251,7 +2344,7 @@ const Rankings = ({players, statsCache, setStatsCache, goT, goP, sleeperMap, esp
     </div>
 
     {/* ── Stat summary cards ── */}
-    <div style={{display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:10, marginBottom:14}}>
+    <div style={{display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:8, marginBottom:10}}>
       {[
         {l:"Players Ranked", v:displayed.length,                           c:"var(--em)"},
         {l:"With Stat Data",  v:displayed.filter(p=>p.hasData).length,    c:"var(--lm)"},
@@ -2278,13 +2371,13 @@ const Rankings = ({players, statsCache, setStatsCache, goT, goP, sleeperMap, esp
               <th style={{...th, width:100, color:'var(--em)'}}>Volume <span style={{fontSize:9, fontWeight:400}}>(40%)</span></th>
               <th style={{...th, width:100, color:'var(--sk)'}}>Efficiency <span style={{fontSize:9, fontWeight:400}}>(25%)</span></th>
               <th style={{...th, width:100, color:'var(--lm)'}}>Trend <span style={{fontSize:9, fontWeight:400}}>(20%)</span></th>
-              <th style={{...th, width:100, color:'var(--vi)'}}>Matchup <span style={{fontSize:9, fontWeight:400}}>(15%)</span></th>
               <th style={{...th, width:70, color:'#C084FC', cursor:'pointer'}} title="Sleeper positional search rank (lower = better)" onClick={()=>setSortKey('sleeperRank')}>
                 Sleeper{sortKey==='sleeperRank'?' ↑':' ↕'}
               </th>
               <th style={{...th, width:70, color:'#FF3D5A', cursor:'pointer'}} title="ESPN Fantasy PPR draft rank (lower = better)" onClick={()=>setSortKey('espnRank')}>
                 ESPN{sortKey==='espnRank'?' ↑':' ↕'}
               </th>
+              <th style={{...th, width:60}} title="Our rank vs consensus avg (Sleeper+ESPN). ▲=we rank higher (hidden gem), ▼=we rank lower (fade)">DIFF</th>
               <th style={{...th, width:36}}/>
             </tr>
           </thead>
@@ -2323,8 +2416,14 @@ const Rankings = ({players, statsCache, setStatsCache, goT, goP, sleeperMap, esp
                         onClick={e=>{e.stopPropagation();goP(p.id)}}
                         onError={e=>{e.target.style.opacity='.2'}}/>
                       <div>
-                        <div style={{fontWeight:800, fontSize:14, cursor:'pointer'}}
-                          onClick={e=>{e.stopPropagation();goP(p.id)}}>{p.nm}</div>
+                        <div style={{display:'flex',alignItems:'center',gap:6}}>
+                          <div style={{fontWeight:800, fontSize:14, cursor:'pointer'}}
+                            onClick={e=>{e.stopPropagation();goP(p.id)}}>{p.nm}</div>
+                          {(()=>{ const wx=weatherMap?.get(p.tm); if(!wx||wx.isIndoor) return null;
+                            if(wx.wind>25) return <span style={{display:'inline-flex',alignItems:'center',gap:3,background:'rgba(0,196,255,.12)',border:'1px solid rgba(0,196,255,.3)',color:'var(--em)',fontSize:9,fontWeight:700,padding:'1px 5px',borderRadius:3,fontFamily:"'Exo 2',sans-serif",letterSpacing:.5}} title={`${Math.round(wx.wind)} mph winds`}>💨 WIND</span>;
+                            if(wx.temp<32) return <span style={{display:'inline-flex',alignItems:'center',gap:3,background:'rgba(147,197,253,.12)',border:'1px solid rgba(147,197,253,.3)',color:'#93c5fd',fontSize:9,fontWeight:700,padding:'1px 5px',borderRadius:3,fontFamily:"'Exo 2',sans-serif",letterSpacing:.5}} title={`${Math.round(wx.temp)}°F`}>❄️ COLD</span>;
+                            return null; })()}
+                        </div>
                         {!p.hasData && <span style={{fontSize:10, color:'var(--rs)', fontStyle:'italic'}}>loading…</span>}
                       </div>
                     </div>
@@ -2365,7 +2464,6 @@ const Rankings = ({players, statsCache, setStatsCache, goT, goP, sleeperMap, esp
                   <td style={td}><MiniBar val={p.volume}     color="var(--em)"/></td>
                   <td style={td}><MiniBar val={p.efficiency} color="var(--sk)"/></td>
                   <td style={td}><MiniBar val={p.trend}      color="var(--lm)"/></td>
-                  <td style={td}><MiniBar val={p.matchup}    color="var(--vi)"/></td>
 
                   {/* External draft rank columns */}
                   <td style={{...td, textAlign:'center'}}>
@@ -2383,6 +2481,20 @@ const Rankings = ({players, statsCache, setStatsCache, goT, goP, sleeperMap, esp
                         ? <span style={{fontFamily:"'Bebas Neue'", fontSize:16, color:'#FF3D5A'}}>{p.espnRank}</span>
                         : <span style={{color:'rgba(255,255,255,.2)', fontSize:12}}>—</span>
                     }
+                  </td>
+
+                  {/* Consensus DIFF column */}
+                  <td style={{...td, textAlign:'center'}}>
+                    {(() => {
+                      const cRank = p.sleeperRank && p.espnRank
+                        ? Math.round((p.sleeperRank + p.espnRank) / 2)
+                        : p.sleeperRank ?? p.espnRank ?? null;
+                      if (!cRank || extLoading) return <span style={{color:'rgba(255,255,255,.15)', fontSize:11}}>—</span>;
+                      const diff = cRank - (i + 1); // positive = we rank higher = gem
+                      if (diff > 10) return <span style={{fontFamily:"'Bebas Neue'", fontSize:14, color:'#4ade80', fontWeight:700}} title="We rank this player significantly higher than consensus">▲{diff}</span>;
+                      if (diff < -10) return <span style={{fontFamily:"'Bebas Neue'", fontSize:14, color:'#f87171', fontWeight:700}} title="We rank this player significantly lower than consensus">▼{Math.abs(diff)}</span>;
+                      return <span style={{color:'rgba(255,255,255,.25)', fontSize:11}}>≈</span>;
+                    })()}
                   </td>
 
                   {/* Expand toggle */}
@@ -2558,6 +2670,7 @@ export default function App() {
   const[sleeperMap,setSleeperMap]=useState(new Map());
   const[espnMap,setEspnMap]=useState(new Map());
   const[extLoading,setExtLoading]=useState(true);
+  const[weatherMap,setWeatherMap]=useState(new Map());
 
   // Fetch all rosters on mount
   useEffect(()=>{
@@ -2572,6 +2685,29 @@ export default function App() {
     Promise.all([fetchSleeperRankings(), fetchEspnFantasyRankings()])
       .then(([sMap,eMap])=>{ setSleeperMap(sMap); setEspnMap(eMap); })
       .finally(()=>setExtLoading(false));
+  },[]);
+
+  // Fetch current-week weather from ESPN scoreboard
+  useEffect(()=>{
+    espn(`${SITE}/scoreboard?limit=50`).then(wxData=>{
+      const map = new Map();
+      for (const ev of wxData?.events || []) {
+        const c = ev.competitions?.[0];
+        if (!c) continue;
+        const wx = c.weather || null;
+        const isIndoor = c.venue?.indoor || false;
+        for (const team of c.competitors || []) {
+          const ab = team.team?.abbreviation;
+          if (ab) map.set(ab, {
+            wind: wx?.windSpeed || 0,
+            temp: wx?.temperature ?? 65,
+            condition: wx?.displayValue || "",
+            isIndoor,
+          });
+        }
+      }
+      if (map.size > 0) setWeatherMap(map);
+    }).catch(()=>{});
   },[]);
 
   // Navigation helpers — push current tab to history before switching
@@ -2589,13 +2725,12 @@ export default function App() {
   return <div style={{display:'flex',minHeight:'100vh'}}><style>{CSS}</style>
     <Sidebar tab={tab} go={go} goBack={goBack} canGoBack={tabHistory.length>0}/>
     <div style={{marginLeft:220,flex:1,minWidth:0,display:'flex',flexDirection:'column'}}>
-      {tab==="Home"&&<Home go={go} goT={goT} goP={goP} players={players} loading={loading} statsCache={statsCache}/>}
+      {tab==="Home"&&<Home go={go} goT={goT} goP={goP} players={players} loading={loading} statsCache={statsCache} sleeperMap={sleeperMap}/>}
       {tab==="Players"&&<Players players={players} loading={loading} sel={selP} setSel={setSelP} goT={goT} statsCache={statsCache} setStatsCache={setStatsCache}/>}
       {tab==="Teams"&&<Teams sel={selT} setSel={setSelT} players={players} goP={goP} statsCache={statsCache} sleeperMap={sleeperMap}/>}
-      {tab==="Games"&&<GamesFetch goT={goT}/>}
-      {tab==="Brackets"&&<Brackets goT={goT}/>}
+      {tab==="Games"&&<GamesAndBrackets goT={goT}/>}
       {tab==="Predictions"&&<Predictions goT={goT} players={players} statsCache={statsCache} setStatsCache={setStatsCache}/>}
-      {tab==="Rankings"&&<Rankings players={players} statsCache={statsCache} setStatsCache={setStatsCache} goT={goT} goP={goP} sleeperMap={sleeperMap} espnMap={espnMap} extLoading={extLoading}/>}
+      {tab==="Rankings"&&<Rankings players={players} statsCache={statsCache} setStatsCache={setStatsCache} goT={goT} goP={goP} sleeperMap={sleeperMap} espnMap={espnMap} extLoading={extLoading} weatherMap={weatherMap}/>}
       {tab==="Edge Board"&&<EdgeBoard players={players} statsCache={statsCache} setStatsCache={setStatsCache} goP={goP} sleeperMap={sleeperMap} espnMap={espnMap} extLoading={extLoading}/>}
       <div style={{textAlign:'center',padding:'18px 20px',color:'rgba(232,236,248,.2)',fontSize:11,borderTop:'1px solid var(--bd)',marginTop:'auto'}}>
         <span style={{fontFamily:"'Bebas Neue'",letterSpacing:1}}>GRIDIRON INTEL</span> • Powered by ESPN Public API
